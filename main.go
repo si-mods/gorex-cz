@@ -378,6 +378,10 @@ func readKeys(path string, keys chan<- keyEvent, quit chan<- struct{}) {
 			// Tab is tapped for the picker and held to talk.
 			keys <- keyEvent{Code: keyTab, Value: ev.Value}
 			continue
+		case keyBackspace:
+			// Backspace repeats while held: the tca8418 has no EV_REP.
+			keys <- keyEvent{Code: keyBackspace, Value: ev.Value}
+			continue
 		}
 		if ev.Value != 1 {
 			continue
@@ -629,6 +633,10 @@ type app struct {
 	partial   string
 	notice    string
 	noticeTil time.Time
+
+	bsPress   chan struct{}
+	bsRelease chan struct{}
+	bsRepeat  chan struct{}
 	sttNames  [2]string
 
 	f  *faces
@@ -922,6 +930,7 @@ func main() {
 	mic := flag.String("mic", "plughw:1,0", "ALSA capture device (ES8389)")
 	sttStream := flag.String("stt-stream", "", "streaming speech-to-text endpoint, e.g. ws://192.168.8.203:8711/stream")
 	fakeWav := flag.String("fakewav", "", "use this wav instead of the microphone (testing)")
+	lockPath := flag.String("lock", "/tmp/czgorex.lock", "single-instance lock file")
 	flag.Parse()
 
 	cfg := loadConfig()
@@ -1014,7 +1023,7 @@ func main() {
 		return
 	}
 
-	lock, err := os.OpenFile("/tmp/czgorex.lock", os.O_CREATE|os.O_RDWR, 0o666)
+	lock, err := os.OpenFile(*lockPath, os.O_CREATE|os.O_RDWR, 0o666)
 	if err != nil {
 		fmt.Println("lock:", err)
 		os.Exit(1)
@@ -1091,6 +1100,36 @@ func main() {
 		a.status = "no session"
 	}
 	fmt.Println("session:", a.session)
+
+	a.bsPress = make(chan struct{}, 1)
+	a.bsRelease = make(chan struct{}, 1)
+	a.bsRepeat = make(chan struct{}, 8)
+	go func() {
+		for range a.bsPress {
+			// first repeat after 400 ms, then every 60 ms until released
+			t := time.NewTimer(400 * time.Millisecond)
+			select {
+			case <-a.bsRelease:
+				t.Stop()
+				continue
+			case <-t.C:
+			}
+			tick := time.NewTicker(60 * time.Millisecond)
+			held := true
+			for held {
+				select {
+				case <-tick.C:
+					select {
+					case a.bsRepeat <- struct{}{}:
+					default:
+					}
+				case <-a.bsRelease:
+					held = false
+				}
+			}
+			tick.Stop()
+		}
+	}()
 
 	keys := make(chan keyEvent, 64)
 	quit := make(chan struct{})
@@ -1324,8 +1363,19 @@ func main() {
 					go func() { _ = c.send(host, id, line) }()
 				}
 			case k.Code == keyBackspace:
-				if len(a.buf) > 0 {
-					a.buf = a.buf[:len(a.buf)-1]
+				if k.Value == 0 {
+					select {
+					case a.bsRelease <- struct{}{}:
+					default:
+					}
+				} else if k.Value == 1 {
+					if len(a.buf) > 0 {
+						a.buf = a.buf[:len(a.buf)-1]
+					}
+					select {
+					case a.bsPress <- struct{}{}:
+					default:
+					}
 				}
 			case empty && k.Code >= 5 && k.Code <= 9: // KEY_4..KEY_8
 				switch k.Code {
@@ -1504,6 +1554,14 @@ func main() {
 				a.buf = append(a.buf, []rune(txt)...)
 			}
 			render()
+		case <-a.bsRepeat:
+			if os.Getenv("CZGOREX_DEBUG") != "" {
+				fmt.Println("bs repeat, buf", len(a.buf))
+			}
+			if len(a.buf) > 0 {
+				a.buf = a.buf[:len(a.buf)-1]
+				render()
+			}
 		case <-voiceTick.C:
 			if a.rec != nil {
 				a.status = fmt.Sprintf("REC %.1fs", time.Since(a.rec.started).Seconds())

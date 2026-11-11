@@ -43,7 +43,7 @@ non-text states. Type a digit first and keys 4–8 insert digits instead.
 | Key | Action |
 |---|---|
 | Enter | send the line (`gorex send --enter`) |
-| Backspace | delete a character |
+| Backspace | delete a character; hold to repeat (400 ms delay, then every 60 ms) |
 | ESC | quit and restore the previous framebuffer content |
 
 ## Voice input
@@ -250,6 +250,7 @@ of them may run: `Conflicts=` hands the panel over in both directions. A
 | `-mic` | `plughw:1,0` | ALSA capture device (ES8389) |
 | `-voicetest` | 0 | record N seconds, transcribe, print, exit |
 | `-stt-stream` | — | WebSocket streaming endpoint (`ws://host:8711/stream`) |
+| `-lock` | `/tmp/czgorex.lock` | single-instance lock file (tests use their own) |
 
 Exiting (ESC, SIGTERM) writes the framebuffer content captured at startup back
 to the panel, so the launcher's screen is restored rather than left half drawn.
