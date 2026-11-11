@@ -46,6 +46,36 @@ non-text states. Type a digit first and keys 4–8 insert digits instead.
 | Backspace | delete a character |
 | ESC | quit and restore the previous framebuffer content |
 
+## Voice input
+
+Hold **TAB** for ~350 ms and talk; release ends the recording. A quick tap
+still opens the picker, so the same key does both, as the CardputerZero key
+guide has it (short TAB = TAB, long = voice).
+
+- Audio: `arecord -D plughw:1,0 -f S16_LE -r 16000 -c 1` (the ES8389 codec;
+  ALSA's `default` has no capture slave on this image, hence the explicit
+  device — override with `-mic`).
+- Every recording is kept: `~/.local/share/czgorex/voice-<ts>.wav`.
+- `-stt CMD` transcribes: CMD runs under `sh -c` with the wav path in `$1` and
+  `$VOICE_WAV`, and its stdout is the text. Without `-stt` the wav is saved and
+  nothing else happens.
+- The text lands in the input line for review; `-voicesend` sends it to the
+  session instead.
+- While recording the status bar shows a red dot and `REC n.ns`.
+
+```sh
+# local whisper.cpp
+./czgorex -stt 'whisper-cli -m ggml-base.bin -f "$VOICE_WAV" -nt'
+
+# any HTTP speech-to-text, e.g. OpenAI
+./czgorex -stt 'curl -s -H "Authorization: Bearer $KEY" \
+  -F file=@"$VOICE_WAV" -F model=whisper-1 \
+  https://api.openai.com/v1/audio/transcriptions | jq -r .text'
+```
+
+`-voicetest N` records N seconds, runs the same pipeline and prints the result,
+which is the quickest way to check the microphone without touching the UI.
+
 ## Hosts and sessions
 
 **TAB** (or the on-screen `TAB:close`) opens the picker:
@@ -167,6 +197,11 @@ of them may run: `Conflicts=` hands the panel over in both directions. A
 | `-bitmap` | false | use the 7×13 bitmap face instead |
 | `-overlay` | false | open the host picker at startup (for screenshots) |
 | `-bench` | 0 | render N frames, print the average, exit |
+| `-stt` | — | speech-to-text command; wav path in `$1`/`$VOICE_WAV`, text on stdout |
+| `-voicesend` | false | send recognised speech straight to the session |
+| `-voice-dir` | `~/.local/share/czgorex` | where recordings are kept |
+| `-mic` | `plughw:1,0` | ALSA capture device (ES8389) |
+| `-voicetest` | 0 | record N seconds, transcribe, print, exit |
 
 Exiting (ESC, SIGTERM) writes the framebuffer content captured at startup back
 to the panel, so the launcher's screen is restored rather than left half drawn.

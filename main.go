@@ -15,9 +15,11 @@ package main
 // with a short tick pointing at its key.
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"image"
@@ -295,18 +297,19 @@ type inputEvent struct {
 }
 
 type keyEvent struct {
-	Code uint16
-	Rune rune
+	Code  uint16
+	Rune  rune
+	Value int32 // 1 press, 0 release (TAB only)
 }
 
-func findKeyboard() string {
+func findKeyboard(needle string) string {
 	b, err := os.ReadFile("/proc/bus/input/devices")
 	if err != nil {
 		return ""
 	}
 	name, handler := "", ""
 	pick := func() string {
-		if strings.Contains(name, "tca8418") {
+		if strings.Contains(name, needle) {
 			for _, f := range strings.Fields(handler) {
 				if strings.HasPrefix(f, "event") {
 					return "/dev/input/" + f
@@ -358,6 +361,10 @@ func readKeys(path string, keys chan<- keyEvent, quit chan<- struct{}) {
 			if ev.Value == 1 {
 				keys <- keyEvent{Code: keyEsc}
 			}
+			continue
+		case keyTab:
+			// Tab is tapped for the picker and held to talk.
+			keys <- keyEvent{Code: keyTab, Value: ev.Value}
 			continue
 		}
 		if ev.Value != 1 {
@@ -472,6 +479,56 @@ func (c *client) send(host, id, text string) error {
 	return err
 }
 
+// recorder captures push-to-talk audio with arecord: 16 kHz mono WAV.
+type recorder struct {
+	cmd     *exec.Cmd
+	path    string
+	started time.Time
+	stderr  *bytes.Buffer
+}
+
+// startRecorder records 16 kHz mono from dev ("plughw:1,0" is the ES8389;
+// ALSA's "default" has no capture slave on this image).
+func startRecorder(dir, dev string) (*recorder, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(dir, "voice-"+time.Now().Format("20060102-150405")+".wav")
+	cmd := exec.Command("arecord", "-q", "-D", dev, "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "wav", path)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return &recorder{cmd: cmd, path: path, started: time.Now(), stderr: &stderr}, nil
+}
+
+// stop ends the recording and reports why it holds no audio.
+func (r *recorder) stop() error {
+	if r.cmd.Process != nil {
+		_ = r.cmd.Process.Signal(os.Interrupt) // arecord finalises the wav header
+		_ = r.cmd.Wait()
+	}
+	if st, err := os.Stat(r.path); err != nil || st.Size() <= 44 {
+		msg := strings.TrimSpace(r.stderr.String())
+		if msg == "" {
+			msg = "no audio recorded"
+		}
+		return errors.New(msg)
+	}
+	return nil
+}
+
+// transcribe runs the speech-to-text command with the wav path at $1 and in
+// $VOICE_WAV, so a pipeline can use either (whisper "$VOICE_WAV",
+// wc -c < "$1", ...); the text comes on stdout.
+func transcribe(cmdStr, path string) (string, error) {
+	cmd := exec.Command("sh", "-c", cmdStr, "czgorex", path)
+	cmd.Env = append(os.Environ(), "VOICE_WAV="+path)
+	out, err := cmd.Output()
+	return strings.TrimSpace(string(out)), err
+}
+
 var ansi = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[@-_]`)
 
 func screenLines(raw string) []string {
@@ -501,6 +558,9 @@ type app struct {
 	focus   int // 0 hosts, 1 sessions
 	adding  bool
 	addBuf  []rune
+
+	rec       *recorder
+	holdTimer *time.Timer
 
 	f  *faces
 	bg *image.RGBA
@@ -550,6 +610,9 @@ func (a *app) drawTerm(img *image.RGBA) {
 	right := fmt.Sprintf("%d/%d %s", a.offset, len(a.lines), time.Now().Format("15:04"))
 	rw := font.MeasureString(f.ui, right).Round()
 	f.uiText(img, dim, w-rw-4, f.barTop-3, right)
+	if a.rec != nil {
+		rect(img, w-rw-14, 4, w-rw-9, 9, color.RGBA{240, 80, 80, 255})
+	}
 	f.uiText(img, white, 3, f.barTop-3, f.fit(where, f.ui, w-rw-12))
 
 	end := len(a.lines) - a.offset
@@ -746,7 +809,41 @@ func main() {
 	useBitmap := flag.Bool("bitmap", false, "use the 7x13 bitmap face instead of the system fonts")
 	startOverlay := flag.Bool("overlay", false, "open the host picker at startup")
 	fontCheck := flag.Bool("fontcheck", false, "report the fonts and the layout, then exit")
+	stt := flag.String("stt", "", `speech-to-text command; the wav path arrives as "$1", the text comes on stdout`)
+	voiceSend := flag.Bool("voicesend", false, "send recognised speech to the session instead of the input line")
+	voiceDir := flag.String("voice-dir", "", "where recordings go (default ~/.local/share/czgorex)")
+	voiceTest := flag.Float64("voicetest", 0, "record N seconds, transcribe, print and exit")
+	mic := flag.String("mic", "plughw:1,0", "ALSA capture device (ES8389)")
 	flag.Parse()
+
+	recordings := *voiceDir
+	if recordings == "" {
+		recordings = filepath.Join(os.Getenv("HOME"), ".local", "share", "czgorex")
+	}
+
+	if *voiceTest > 0 {
+		rec, err := startRecorder(recordings, *mic)
+		if err != nil {
+			fmt.Println("record:", err)
+			os.Exit(1)
+		}
+		time.Sleep(time.Duration(*voiceTest * float64(time.Second)))
+		if err := rec.stop(); err != nil {
+			fmt.Println("record:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("wav: %s (%.1fs)\n", rec.path, time.Since(rec.started).Seconds())
+		if *stt == "" {
+			fmt.Println("no -stt command: recorded only")
+			return
+		}
+		txt, err := transcribe(*stt, rec.path)
+		if err != nil {
+			fmt.Println("stt:", err)
+		}
+		fmt.Println("text:", txt)
+		return
+	}
 
 	if *fontCheck {
 		mono := *monoPath
@@ -791,8 +888,15 @@ func main() {
 	defer fb.close()
 
 	key := *keyPath
+	if key != "" && !strings.HasPrefix(key, "/") {
+		// a device name rather than a path, useful with a virtual keyboard
+		if key = findKeyboard(key); key == "" {
+			fmt.Println("no input device named", *keyPath)
+			os.Exit(1)
+		}
+	}
 	if key == "" {
-		if key = findKeyboard(); key == "" {
+		if key = findKeyboard("tca8418"); key == "" {
 			fmt.Println("no keyboard device found; pass -key")
 			os.Exit(1)
 		}
@@ -838,6 +942,9 @@ func main() {
 
 	keys := make(chan keyEvent, 64)
 	quit := make(chan struct{})
+	voiceStart := make(chan string, 1)
+	voiceStop := make(chan struct{}, 1)
+	voiceDone := make(chan string, 1)
 	go readKeys(key, keys, quit)
 
 	screens := make(chan []string, 4)
@@ -880,6 +987,8 @@ func main() {
 
 	deadline := time.Now().Add(time.Duration(*secs) * time.Second)
 	tick := time.NewTicker(time.Second)
+	voiceTick := time.NewTicker(200 * time.Millisecond)
+	defer voiceTick.Stop()
 	render := func() {
 		img := a.draw()
 		fb.blit(img)
@@ -921,6 +1030,14 @@ func main() {
 		loadSessions()
 	}
 
+	toggleOverlay := func() {
+		if a.overlay {
+			a.overlay = false
+		} else {
+			openOverlay()
+		}
+	}
+
 	render()
 	if *startOverlay {
 		openOverlay()
@@ -945,6 +1062,27 @@ func main() {
 				}
 				fmt.Println("ESC")
 				return
+			}
+			if k.Code == keyTab {
+				if k.Value == 1 {
+					// A tap opens the picker; a hold is push-to-talk.
+					a.holdTimer = time.AfterFunc(350*time.Millisecond, func() {
+						select {
+						case voiceStart <- recordings:
+						default:
+						}
+					})
+				} else {
+					if a.holdTimer != nil {
+						a.holdTimer.Stop()
+						a.holdTimer = nil
+					}
+					select {
+					case voiceStop <- struct{}{}:
+					default:
+					}
+				}
+				continue
 			}
 			if a.adding {
 				switch k.Code {
@@ -977,8 +1115,6 @@ func main() {
 			}
 			if a.overlay {
 				switch {
-				case k.Code == keyTab:
-					a.overlay = false
 				case k.Code == keyEnter:
 					if a.focus == 0 {
 						loadSessions()
@@ -1025,8 +1161,6 @@ func main() {
 
 			empty := len(a.buf) == 0
 			switch {
-			case k.Code == keyTab:
-				openOverlay()
 			case k.Code == keyEnter:
 				line := strings.TrimSpace(string(a.buf))
 				a.buf = nil
@@ -1090,6 +1224,74 @@ func main() {
 			a.status = ""
 			a.scroll(0)
 			render()
+		case dir := <-voiceStart:
+			if a.rec == nil {
+				r, err := startRecorder(dir, *mic)
+				if err != nil {
+					a.status = "mic: " + err.Error()
+				} else {
+					a.rec = r
+					a.status = "REC"
+				}
+				render()
+			}
+		case <-voiceStop:
+			if a.rec == nil {
+				a.status = ""
+				toggleOverlay()
+				render()
+				continue
+			}
+			r := a.rec
+			a.rec = nil
+			recErr := r.stop()
+			if recErr != nil {
+				a.status = "mic: " + recErr.Error()
+				render()
+				continue
+			}
+			if time.Since(r.started) < 300*time.Millisecond {
+				os.Remove(r.path) // too short to be speech: a tap after all
+				a.status = ""
+				toggleOverlay()
+				render()
+				continue
+			}
+			if *stt == "" {
+				a.status = "voice saved"
+				render()
+				continue
+			}
+			a.status = "listening…"
+			render()
+			go func(path string) {
+				txt, _ := transcribe(*stt, path)
+				voiceDone <- txt
+			}(r.path)
+		case txt := <-voiceDone:
+			if txt == "" {
+				a.status = "stt: no text"
+				render()
+				continue
+			}
+			a.status = ""
+			if *voiceSend {
+				a.mu.Lock()
+				host, id := a.host, a.session
+				a.mu.Unlock()
+				go func() { _ = c.send(host, id, txt) }()
+			} else {
+				if len(a.buf) > 0 {
+					a.buf = append(a.buf, ' ')
+				}
+				a.buf = append(a.buf, []rune(txt)...)
+			}
+			render()
+		case <-voiceTick.C:
+			if a.rec != nil {
+				a.status = fmt.Sprintf("REC %.1fs", time.Since(a.rec.started).Seconds())
+				render()
+			}
 		case <-tick.C:
 			if *secs > 0 && time.Now().After(deadline) {
 				fmt.Println("exiting after", *secs, "s")
