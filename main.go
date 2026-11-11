@@ -503,8 +503,28 @@ func startRecorder(dir, dev string) (*recorder, error) {
 	return &recorder{cmd: cmd, path: path, started: time.Now(), stderr: &stderr}, nil
 }
 
+// copyRecorder stands in for the microphone with a wav file, for tests that
+// must not depend on the room.
+func copyRecorder(dir, src string) (*recorder, error) {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(dir, "voice-"+time.Now().Format("20060102-150405")+".wav")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return nil, err
+	}
+	return &recorder{path: path, started: time.Now()}, nil
+}
+
 // stop ends the recording and reports why it holds no audio.
 func (r *recorder) stop() error {
+	if r.cmd == nil {
+		return nil // a copied file: nothing to stop
+	}
 	if r.cmd.Process != nil {
 		_ = r.cmd.Process.Signal(os.Interrupt) // arecord finalises the wav header
 		_ = r.cmd.Wait()
@@ -562,6 +582,11 @@ type app struct {
 	rec       *recorder
 	holdTimer *time.Timer
 
+	sttLocal string
+	sttCloud string
+	sttPick  int // 0 local, 1 cloud
+	sttNames [2]string
+
 	f  *faces
 	bg *image.RGBA
 }
@@ -610,8 +635,15 @@ func (a *app) drawTerm(img *image.RGBA) {
 	right := fmt.Sprintf("%d/%d %s", a.offset, len(a.lines), time.Now().Format("15:04"))
 	rw := font.MeasureString(f.ui, right).Round()
 	f.uiText(img, dim, w-rw-4, f.barTop-3, right)
+	if a.sttLocal != "" || a.sttCloud != "" {
+		tag := "L"
+		if a.sttPick == 1 || a.sttLocal == "" {
+			tag = "C"
+		}
+		f.uiText(img, dim, w-rw-20, f.barTop-3, tag)
+	}
 	if a.rec != nil {
-		rect(img, w-rw-14, 4, w-rw-9, 9, color.RGBA{240, 80, 80, 255})
+		rect(img, w-rw-30, 4, w-rw-25, 9, color.RGBA{240, 80, 80, 255})
 	}
 	f.uiText(img, white, 3, f.barTop-3, f.fit(where, f.ui, w-rw-12))
 
@@ -810,19 +842,34 @@ func main() {
 	startOverlay := flag.Bool("overlay", false, "open the host picker at startup")
 	fontCheck := flag.Bool("fontcheck", false, "report the fonts and the layout, then exit")
 	stt := flag.String("stt", "", `speech-to-text command; the wav path arrives as "$1", the text comes on stdout`)
+	sttLocal := flag.String("stt-local", "", "on-machine speech-to-text command ($1 / $VOICE_WAV)")
+	sttCloud := flag.String("stt-cloud", "", "network speech-to-text command ($1 / $VOICE_WAV)")
+	sttDefault := flag.String("stt-default", "local", "engine to use first: local or cloud")
 	voiceSend := flag.Bool("voicesend", false, "send recognised speech to the session instead of the input line")
 	voiceDir := flag.String("voice-dir", "", "where recordings go (default ~/.local/share/czgorex)")
 	voiceTest := flag.Float64("voicetest", 0, "record N seconds, transcribe, print and exit")
 	mic := flag.String("mic", "plughw:1,0", "ALSA capture device (ES8389)")
+	fakeWav := flag.String("fakewav", "", "use this wav instead of the microphone (testing)")
 	flag.Parse()
+
+	if *stt != "" && *sttLocal == "" {
+		*sttLocal = *stt
+	}
 
 	recordings := *voiceDir
 	if recordings == "" {
 		recordings = filepath.Join(os.Getenv("HOME"), ".local", "share", "czgorex")
 	}
 
+	startCapture := func(dir string) (*recorder, error) {
+		if *fakeWav != "" {
+			return copyRecorder(dir, *fakeWav)
+		}
+		return startRecorder(dir, *mic)
+	}
+
 	if *voiceTest > 0 {
-		rec, err := startRecorder(recordings, *mic)
+		rec, err := startCapture(recordings)
 		if err != nil {
 			fmt.Println("record:", err)
 			os.Exit(1)
@@ -833,11 +880,18 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Printf("wav: %s (%.1fs)\n", rec.path, time.Since(rec.started).Seconds())
-		if *stt == "" {
-			fmt.Println("no -stt command: recorded only")
+		engine := *stt
+		if engine == "" {
+			engine = *sttLocal
+			if strings.EqualFold(*sttDefault, "cloud") {
+				engine = *sttCloud
+			}
+		}
+		if engine == "" {
+			fmt.Println("no stt command: recorded only")
 			return
 		}
-		txt, err := transcribe(*stt, rec.path)
+		txt, err := transcribe(engine, rec.path)
 		if err != nil {
 			fmt.Println("stt:", err)
 		}
@@ -928,7 +982,14 @@ func main() {
 	dir := filepath.Join(os.Getenv("HOME"), ".gorex")
 	c := &client{bin: exe, env: append(os.Environ(), "GOREX_DIR="+dir), dir: dir}
 
-	a := &app{status: "connecting", f: fc}
+	a := &app{status: "connecting", f: fc, sttLocal: *sttLocal, sttCloud: *sttCloud}
+	a.sttNames = [2]string{"local", "cloud"}
+	if strings.EqualFold(*sttDefault, "cloud") && a.sttCloud != "" {
+		a.sttPick = 1
+	}
+	if a.sttLocal == "" && a.sttCloud != "" {
+		a.sttPick = 1
+	}
 	if *session != "" {
 		a.session = *session
 	} else if list, err := c.sessions(""); err == nil && len(list) > 0 {
@@ -1196,6 +1257,20 @@ func main() {
 				case 9:
 					a.scroll(-1)
 				}
+			case empty && k.Code == 10: // KEY_9: cycle local/cloud
+				switch {
+				case a.sttLocal == "" && a.sttCloud == "":
+					a.status = "no stt engine"
+				case a.sttCloud == "":
+					a.sttPick = 0
+					a.status = "stt: local"
+				case a.sttLocal == "":
+					a.sttPick = 1
+					a.status = "stt: cloud"
+				default:
+					a.sttPick = 1 - a.sttPick
+					a.status = "stt: " + a.sttNames[a.sttPick]
+				}
 			case empty && (k.Code == 33 || k.Code == 45 || k.Code == 44 || k.Code == 46):
 				// F up, X down, Z page up, C page down
 				switch k.Code {
@@ -1226,7 +1301,7 @@ func main() {
 			render()
 		case dir := <-voiceStart:
 			if a.rec == nil {
-				r, err := startRecorder(dir, *mic)
+				r, err := startCapture(dir)
 				if err != nil {
 					a.status = "mic: " + err.Error()
 				} else {
@@ -1257,7 +1332,7 @@ func main() {
 				render()
 				continue
 			}
-			if *stt == "" {
+			if a.sttLocal == "" && a.sttCloud == "" {
 				a.status = "voice saved"
 				render()
 				continue
@@ -1265,7 +1340,20 @@ func main() {
 			a.status = "listening…"
 			render()
 			go func(path string) {
-				txt, _ := transcribe(*stt, path)
+				a.mu.Lock()
+				cmds := [2]string{a.sttLocal, a.sttCloud}
+				pick := a.sttPick
+				a.mu.Unlock()
+				txt, first := "", cmds[pick]
+				if first != "" {
+					txt, _ = transcribe(first, path)
+				}
+				if txt == "" {
+					other := cmds[1-pick]
+					if other != "" {
+						txt, _ = transcribe(other, path)
+					}
+				}
 				voiceDone <- txt
 			}(r.path)
 		case txt := <-voiceDone:
