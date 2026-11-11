@@ -38,7 +38,7 @@ pointing at its key.
 
 While the input line is empty, `F` `X` `Z` `C` act as the arrow keys
 (up / down / page up / page down), as the guideline recommends for
-non-text states. Type a digit first and keys 4–8 insert digits instead.
+non-text states — and they repeat while held, like backspace. Type a digit first and keys 4–8 insert digits instead.
 
 | Key | Action |
 |---|---|
@@ -251,6 +251,7 @@ of them may run: `Conflicts=` hands the panel over in both directions. A
 | `-voicetest` | 0 | record N seconds, transcribe, print, exit |
 | `-stt-stream` | — | WebSocket streaming endpoint (`ws://host:8711/stream`) |
 | `-lock` | `/tmp/czgorex.lock` | single-instance lock file (tests use their own) |
+| `-version` | — | print the VCS revision and exit (also logged at startup) |
 
 Exiting (ESC, SIGTERM) writes the framebuffer content captured at startup back
 to the panel, so the launcher's screen is restored rather than left half drawn.

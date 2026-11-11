@@ -32,6 +32,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -378,9 +379,10 @@ func readKeys(path string, keys chan<- keyEvent, quit chan<- struct{}) {
 			// Tab is tapped for the picker and held to talk.
 			keys <- keyEvent{Code: keyTab, Value: ev.Value}
 			continue
-		case keyBackspace:
-			// Backspace repeats while held: the tca8418 has no EV_REP.
-			keys <- keyEvent{Code: keyBackspace, Value: ev.Value}
+		case keyBackspace, 33, 44, 45, 46:
+			// These repeat while held (the tca8418 has no EV_REP): backspace
+			// deletes, F/X scroll, Z/C page.
+			keys <- keyEvent{Code: ev.Code, Value: ev.Value}
 			continue
 		}
 		if ev.Value != 1 {
@@ -634,10 +636,10 @@ type app struct {
 	notice    string
 	noticeTil time.Time
 
-	bsPress   chan struct{}
-	bsRelease chan struct{}
-	bsRepeat  chan struct{}
-	sttNames  [2]string
+	repPress   chan uint16
+	repRelease chan struct{}
+	repTick    chan uint16
+	sttNames   [2]string
 
 	f  *faces
 	bg *image.RGBA
@@ -796,6 +798,33 @@ func (a *app) noticeFor(msg string, d time.Duration) {
 	a.notice, a.noticeTil = msg, time.Now().Add(d)
 }
 
+// buildRev is the VCS revision Go embeds, so a running instance can be told
+// apart from an older one.
+func buildRev() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "dev"
+	}
+	rev, dirty := "", ""
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.modified":
+			if s.Value == "true" {
+				dirty = "+dirty"
+			}
+		}
+	}
+	if len(rev) > 12 {
+		rev = rev[:12]
+	}
+	if rev == "" {
+		return "dev"
+	}
+	return rev + dirty
+}
+
 // short cuts a string to n runes with an ellipsis, for the status bar.
 func short(s string, n int) string {
 	r := []rune(s)
@@ -803,6 +832,24 @@ func short(s string, n int) string {
 		return s
 	}
 	return string(r[:n]) + "…"
+}
+
+// repeatAction is what a key does once, and again on every repeat tick.
+func (a *app) repeatAction(code uint16) {
+	switch code {
+	case keyBackspace:
+		if len(a.buf) > 0 {
+			a.buf = a.buf[:len(a.buf)-1]
+		}
+	case 33: // F, up
+		a.scroll(1)
+	case 45: // X, down
+		a.scroll(-1)
+	case 44: // Z, page up
+		a.page(1)
+	case 46: // C, page down
+		a.page(-1)
+	}
 }
 
 func (a *app) scroll(delta int) {
@@ -931,7 +978,14 @@ func main() {
 	sttStream := flag.String("stt-stream", "", "streaming speech-to-text endpoint, e.g. ws://192.168.8.203:8711/stream")
 	fakeWav := flag.String("fakewav", "", "use this wav instead of the microphone (testing)")
 	lockPath := flag.String("lock", "/tmp/czgorex.lock", "single-instance lock file")
+	showVersion := flag.Bool("version", false, "print the build and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("czgorex", buildRev())
+		return
+	}
+	fmt.Println("czgorex", buildRev())
 
 	cfg := loadConfig()
 	if *sttStream == "" {
@@ -1101,15 +1155,15 @@ func main() {
 	}
 	fmt.Println("session:", a.session)
 
-	a.bsPress = make(chan struct{}, 1)
-	a.bsRelease = make(chan struct{}, 1)
-	a.bsRepeat = make(chan struct{}, 8)
+	a.repPress = make(chan uint16, 1)
+	a.repRelease = make(chan struct{}, 1)
+	a.repTick = make(chan uint16, 8)
 	go func() {
-		for range a.bsPress {
+		for code := range a.repPress {
 			// first repeat after 400 ms, then every 60 ms until released
 			t := time.NewTimer(400 * time.Millisecond)
 			select {
-			case <-a.bsRelease:
+			case <-a.repRelease:
 				t.Stop()
 				continue
 			case <-t.C:
@@ -1120,10 +1174,10 @@ func main() {
 				select {
 				case <-tick.C:
 					select {
-					case a.bsRepeat <- struct{}{}:
+					case a.repTick <- code:
 					default:
 					}
-				case <-a.bsRelease:
+				case <-a.repRelease:
 					held = false
 				}
 			}
@@ -1362,18 +1416,17 @@ func main() {
 					a.mu.Unlock()
 					go func() { _ = c.send(host, id, line) }()
 				}
-			case k.Code == keyBackspace:
+			case k.Code == keyBackspace || (empty && (k.Code == 33 || k.Code == 45 || k.Code == 44 || k.Code == 46)):
+				// Backspace and the arrow keys repeat while held.
 				if k.Value == 0 {
 					select {
-					case a.bsRelease <- struct{}{}:
+					case a.repRelease <- struct{}{}:
 					default:
 					}
 				} else if k.Value == 1 {
-					if len(a.buf) > 0 {
-						a.buf = a.buf[:len(a.buf)-1]
-					}
+					a.repeatAction(k.Code)
 					select {
-					case a.bsPress <- struct{}{}:
+					case a.repPress <- k.Code:
 					default:
 					}
 				}
@@ -1411,18 +1464,6 @@ func main() {
 				default:
 					a.sttPick = 1 - a.sttPick
 					a.status = "stt: " + a.sttNames[a.sttPick]
-				}
-			case empty && (k.Code == 33 || k.Code == 45 || k.Code == 44 || k.Code == 46):
-				// F up, X down, Z page up, C page down
-				switch k.Code {
-				case 33:
-					a.scroll(1)
-				case 45:
-					a.scroll(-1)
-				case 44:
-					a.page(1)
-				case 46:
-					a.page(-1)
 				}
 			case k.Rune != 0:
 				if len(a.buf) < 44 {
@@ -1554,14 +1595,12 @@ func main() {
 				a.buf = append(a.buf, []rune(txt)...)
 			}
 			render()
-		case <-a.bsRepeat:
+		case code := <-a.repTick:
 			if os.Getenv("CZGOREX_DEBUG") != "" {
-				fmt.Println("bs repeat, buf", len(a.buf))
+				fmt.Println("repeat", code, "buf", len(a.buf), "offset", a.offset)
 			}
-			if len(a.buf) > 0 {
-				a.buf = a.buf[:len(a.buf)-1]
-				render()
-			}
+			a.repeatAction(code)
+			render()
 		case <-voiceTick.C:
 			if a.rec != nil {
 				a.status = fmt.Sprintf("REC %.1fs", time.Since(a.rec.started).Seconds())
