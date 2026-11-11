@@ -271,6 +271,27 @@ MVP. Known gaps: no colour (ANSI SGR is stripped), no cursor addressing, one
 session only, plain 7×13 bitmap font, and the CLI round trip per poll is
 heavier than a direct socket client would be.
 
+## Configuration
+
+Flags alone are not enough when the app is opened from the CardputerZero
+launcher (it starts `czgorex` with no arguments), so settings persist in
+`~/.config/czgorex/config.json`; an explicit flag wins over the file.
+
+```json
+{
+  "stt_stream": "ws://192.168.8.203:8711/stream",
+  "stt_cloud": "curl -s -m 30 --data-binary @\"$VOICE_WAV\" \"http://192.168.8.203:8710/v1/audio/transcriptions?response_format=text\"",
+  "stt_default": "cloud",
+  "mic": "plughw:1,0"
+}
+```
+
+Keys: `stt_stream`, `stt_local`, `stt_cloud`, `stt_default`, `mic`,
+`voice_dir`. When no engine is configured at all, a recording is kept and its
+path is put in the input line, with a `saved voice-….wav` notice in the status
+bar (notices last a few seconds instead of vanishing on the next screen
+refresh).
+
 ## Testing
 
 The device is used in public places, so **tests never play sound**: the sink

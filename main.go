@@ -480,6 +480,33 @@ func (c *client) send(host, id, text string) error {
 	return err
 }
 
+// config is what the app remembers between runs, so a launcher start (no
+// flags) still knows which engines to use.
+type config struct {
+	STTStream  string `json:"stt_stream,omitempty"`
+	STTLocal   string `json:"stt_local,omitempty"`
+	STTCloud   string `json:"stt_cloud,omitempty"`
+	STTDefault string `json:"stt_default,omitempty"`
+	Mic        string `json:"mic,omitempty"`
+	VoiceDir   string `json:"voice_dir,omitempty"`
+}
+
+func configPath() string {
+	base := os.Getenv("XDG_CONFIG_HOME")
+	if base == "" {
+		base = filepath.Join(os.Getenv("HOME"), ".config")
+	}
+	return filepath.Join(base, "czgorex", "config.json")
+}
+
+func loadConfig() config {
+	var c config
+	if b, err := os.ReadFile(configPath()); err == nil {
+		_ = json.Unmarshal(b, &c)
+	}
+	return c
+}
+
 // recorder captures push-to-talk audio with arecord: 16 kHz mono WAV.
 type recorder struct {
 	cmd     *exec.Cmd
@@ -589,6 +616,8 @@ type app struct {
 	sttPick   int // 0 local, 1 cloud
 	stream    *streamer
 	partial   string
+	notice    string
+	noticeTil time.Time
 	sttNames  [2]string
 
 	f  *faces
@@ -633,7 +662,9 @@ func (a *app) drawTerm(img *image.RGBA) {
 	if a.host != "" {
 		where = a.host + " " + short
 	}
-	if a.partial != "" && a.stream != nil {
+	if a.notice != "" && time.Now().Before(a.noticeTil) {
+		where += " " + a.notice
+	} else if a.partial != "" && a.stream != nil {
 		where += " " + a.partial
 	} else if a.status != "" {
 		where += " " + a.status
@@ -739,6 +770,11 @@ func (a *app) partialCh() chan string {
 		return nil
 	}
 	return a.stream.partials
+}
+
+// notice shows a message for d, past the next screen refresh.
+func (a *app) noticeFor(msg string, d time.Duration) {
+	a.notice, a.noticeTil = msg, time.Now().Add(d)
 }
 
 // short cuts a string to n runes with an ellipsis, for the status bar.
@@ -877,6 +913,25 @@ func main() {
 	fakeWav := flag.String("fakewav", "", "use this wav instead of the microphone (testing)")
 	flag.Parse()
 
+	cfg := loadConfig()
+	if *sttStream == "" {
+		*sttStream = cfg.STTStream
+	}
+	if *sttLocal == "" {
+		*sttLocal = cfg.STTLocal
+	}
+	if *sttCloud == "" {
+		*sttCloud = cfg.STTCloud
+	}
+	if *sttDefault == "" {
+		*sttDefault = cfg.STTDefault
+	}
+	if *mic == "" {
+		*mic = cfg.Mic
+	}
+	if *voiceDir == "" {
+		*voiceDir = cfg.VoiceDir
+	}
 	if *stt != "" && *sttLocal == "" {
 		*sttLocal = *stt
 	}
@@ -1329,7 +1384,7 @@ func main() {
 				if a.sttStream != "" {
 					st, err := startStream(context.Background(), a.sttStream, *mic, *fakeWav)
 					if err != nil {
-						a.status = "stream: " + err.Error()
+						a.noticeFor("stream: "+err.Error(), 6*time.Second)
 					} else {
 						a.stream = st
 						a.status = "REC"
@@ -1379,7 +1434,7 @@ func main() {
 			a.rec = nil
 			recErr := r.stop()
 			if recErr != nil {
-				a.status = "mic: " + recErr.Error()
+				a.noticeFor("mic: "+recErr.Error(), 6*time.Second)
 				render()
 				continue
 			}
@@ -1391,7 +1446,12 @@ func main() {
 				continue
 			}
 			if a.sttLocal == "" && a.sttCloud == "" {
-				a.status = "voice saved"
+				// nothing can transcribe: keep the file and say so, and leave
+				// the path in the input line so it is not lost
+				a.noticeFor("saved "+filepath.Base(r.path), 6*time.Second)
+				if len(a.buf) == 0 {
+					a.buf = []rune(r.path)
+				}
 				render()
 				continue
 			}
@@ -1416,7 +1476,7 @@ func main() {
 			}(r.path)
 		case txt := <-voiceDone:
 			if txt == "" {
-				a.status = "stt: no text"
+				a.noticeFor("stt: no text", 5*time.Second)
 				render()
 				continue
 			}
