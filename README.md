@@ -79,6 +79,25 @@ the terminal view attaches to; commands for a remote host run as
 `gorex remote pair start`, then `gorex remote pending` / `remote approve KEY`
 on its side. Until it does, the host's session list reports unreachable.
 
+## Fonts
+
+The UI uses the fonts the CardputerZero image ships, as its app guideline asks
+(12px or larger, Regular weight or heavier):
+
+| Use | Face | Path |
+|---|---|---|
+| Terminal, input line | DejaVu Sans Mono 12px | `/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf` |
+| Status bar, picker, lists | DejaVu Sans 12px | `/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf` |
+| CJK (中文 / 日本語 / 한국어) | Noto Sans CJK SC 12px | `/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc` |
+
+Text is drawn with `golang.org/x/image/font/opentype` (no cgo). A rune at or
+above U+2E80 switches to the CJK face, which is loaded the first time such a
+rune is drawn — the 19 MB collection costs ~45 MB RSS once it is in use, so a
+few hundred KB until then. On this 320×170 panel 12px gives 7 visible lines of
+session text.
+
+`-bitmap` falls back to the 7×13 bitmap face (smaller, no TrueType, no CJK).
+
 ## Requirements
 
 - A CardputerZero (Raspberry Pi CM0, Debian 13 aarch64) with `/dev/fb0` and the
@@ -135,6 +154,13 @@ of them may run: `Conflicts=` hands the panel over in both directions. A
 | `-session` | first/created | session id to attach to |
 | `-shot` | — | write a PNG + raw panel dump of every frame |
 | `-secs` | 0 (forever) | exit after N seconds |
+| `-fontsize` | 12 | text size in pixels (guideline: 12 or larger) |
+| `-mono` | DejaVuSansMono.ttf | terminal font |
+| `-ui-font` | DejaVuSans.ttf | status bar and picker font |
+| `-cjk-font` | NotoSansCJK-Regular.ttc | CJK fallback |
+| `-bitmap` | false | use the 7×13 bitmap face instead |
+| `-overlay` | false | open the host picker at startup (for screenshots) |
+| `-bench` | 0 | render N frames, print the average, exit |
 
 Exiting (ESC, SIGTERM) writes the framebuffer content captured at startup back
 to the panel, so the launcher's screen is restored rather than left half drawn.

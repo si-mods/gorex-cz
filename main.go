@@ -6,6 +6,10 @@ package main
 // keyboard from evdev, and talks to GoRex through the gorex CLI — the local
 // session server by default, or a saved remote host picked from the overlay.
 //
+// Text uses the fonts the CardputerZero image ships (DejaVu Sans / Sans Mono,
+// Noto Sans CJK for Chinese, Japanese and Korean) at 12px, as the app
+// guideline asks, with the 7x13 bitmap face kept as a fallback.
+//
 // The bottom bar follows CardputerZero's key guideline: five 22x22 hints
 // centred on x = 49, 105, 161, 217, 273 at y = 153, one per key 4..8, each
 // with a short tick pointing at its key.
@@ -33,6 +37,8 @@ import (
 
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/basicfont"
+	"golang.org/x/image/font/opentype"
+	"golang.org/x/image/font/sfnt"
 	"golang.org/x/image/math/fixed"
 	"golang.org/x/sys/unix"
 )
@@ -41,13 +47,9 @@ const (
 	w = 320
 	h = 170
 
-	barTop   = 14
-	lineH    = 13
-	textTop  = 26
-	rows     = 8
-	inputY   = 133
 	iconY    = 153
 	iconSize = 22
+	inputY   = 136 // input baseline, above the key bar
 )
 
 // Hint centres from the official guideline: keys 4, 5, 6, 7, 8.
@@ -61,6 +63,174 @@ var (
 	colAccent = color.RGBA{120, 220, 255, 255}
 	colSel    = color.RGBA{36, 62, 96, 255}
 )
+
+// faces holds the fonts and the metrics the layout is derived from.
+type faces struct {
+	mono font.Face
+	ui   font.Face
+	cjk  font.Face
+
+	cjkPath  string
+	cjkSize  float64
+	cjkTried bool
+
+	cellW   int
+	lineH   int // one text line: ascent + descent
+	pitch   int // grid step for the terminal and the lists
+	barTop  int
+	textTop int
+	rows    int
+}
+
+func loadFace(path string, index int, size float64) (font.Face, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var f *sfnt.Font
+	if index >= 0 {
+		coll, err := sfnt.ParseCollection(b)
+		if err != nil {
+			return nil, err
+		}
+		if f, err = coll.Font(index); err != nil {
+			return nil, err
+		}
+	} else if f, err = sfnt.Parse(b); err != nil {
+		return nil, err
+	}
+	return opentype.NewFace(f, &opentype.FaceOptions{Size: size, DPI: 72, Hinting: font.HintingFull})
+}
+
+// loadFaces opens the system fonts; mono and ui are required, CJK is loaded
+// the first time a wide rune is drawn.
+func loadFaces(monoPath, uiPath, cjkPath string, size float64) (*faces, error) {
+	mono, err := loadFace(monoPath, -1, size)
+	if err != nil {
+		return nil, fmt.Errorf("mono %s: %w", monoPath, err)
+	}
+	ui, err := loadFace(uiPath, -1, size)
+	if err != nil {
+		return nil, fmt.Errorf("ui %s: %w", uiPath, err)
+	}
+	f := &faces{mono: mono, ui: ui, cjkPath: cjkPath, cjkSize: size}
+
+	m := mono.Metrics()
+	f.lineH = int((m.Ascent + m.Descent + 32) >> 6)
+	if f.lineH < 12 {
+		f.lineH = 12
+	}
+	adv, _ := mono.GlyphAdvance('M')
+	f.cellW = int((adv + 32) >> 6)
+	if f.cellW < 6 {
+		f.cellW = 6
+	}
+	f.pitch = f.lineH
+	if f.pitch > 13 {
+		f.pitch -= 2 // 12px text on a 15px line wastes a row of the 170px panel
+	}
+	f.barTop = f.lineH
+	f.textTop = f.barTop + f.pitch
+	f.rows = (inputY - 12 - f.textTop) / f.pitch
+	if f.rows < 3 {
+		f.rows = 3
+	}
+	return f, nil
+}
+
+// wide reports a rune the mono face rarely has: CJK, kana, hangul, fullwidth.
+func wide(r rune) bool { return r >= 0x2E80 }
+
+// cjkFace loads Noto Sans CJK the first time it is needed, choosing the SC
+// face from the collection when the file is a .ttc.
+func (f *faces) cjkFace() font.Face {
+	if f.cjk != nil || f.cjkTried {
+		return f.cjk
+	}
+	f.cjkTried = true
+	b, err := os.ReadFile(f.cjkPath)
+	if err != nil {
+		return nil
+	}
+	coll, err := sfnt.ParseCollection(b)
+	if err != nil {
+		return nil
+	}
+	best := 0
+	var buf sfnt.Buffer
+	for i := 0; i < coll.NumFonts() && i < 16; i++ {
+		fnt, err := coll.Font(i)
+		if err != nil {
+			continue
+		}
+		name, err := fnt.Name(&buf, sfnt.NameIDFull)
+		if err == nil && strings.Contains(name, "SC") {
+			best = i
+			break
+		}
+	}
+	face, err := loadFace(f.cjkPath, best, f.cjkSize)
+	if err != nil {
+		return nil
+	}
+	f.cjk = face
+	return f.cjk
+}
+
+// draw writes s at (x, y), switching to the CJK face for wide runes, and
+// returns the x after the last glyph.
+func (f *faces) draw(img *image.RGBA, c *image.Uniform, x, y int, s string, primary font.Face) int {
+	if s == "" {
+		return x
+	}
+	start := 0
+	cur := primary
+	flush := func(end int) {
+		if end == start {
+			return
+		}
+		d := font.Drawer{Dst: img, Src: c, Face: cur, Dot: fixed.P(x, y)}
+		d.DrawString(s[start:end])
+		x = d.Dot.X.Round()
+		start = end
+	}
+	for i, r := range s {
+		want := primary
+		if wide(r) {
+			if cj := f.cjkFace(); cj != nil {
+				want = cj
+			}
+		}
+		if want != cur {
+			flush(i)
+			cur = want
+		}
+	}
+	flush(len(s))
+	return x
+}
+
+func (f *faces) monoText(img *image.RGBA, c *image.Uniform, x, y int, s string) int {
+	return f.draw(img, c, x, y, s, f.mono)
+}
+
+func (f *faces) uiText(img *image.RGBA, c *image.Uniform, x, y int, s string) int {
+	return f.draw(img, c, x, y, s, f.ui)
+}
+
+// fit truncates s (adding "~") so it fits maxW pixels in the given face.
+func (f *faces) fit(s string, primary font.Face, maxW int) string {
+	if font.MeasureString(primary, s).Round() <= maxW {
+		return s
+	}
+	runes := []rune(s)
+	for n := len(runes); n > 0; n-- {
+		if font.MeasureString(primary, string(runes[:n])+"~").Round() <= maxW {
+			return string(runes[:n]) + "~"
+		}
+	}
+	return ""
+}
 
 type framebuffer struct {
 	f      *os.File
@@ -326,6 +496,7 @@ type app struct {
 	adding  bool
 	addBuf  []rune
 
+	f  *faces
 	bg *image.RGBA
 }
 
@@ -346,18 +517,19 @@ func (a *app) draw() *image.RGBA {
 	copy(img.Pix, a.bg.Pix)
 	if a.overlay {
 		a.drawOverlay(img)
-		return img
+	} else {
+		a.drawTerm(img)
 	}
-	a.drawTerm(img)
 	return img
 }
 
 func (a *app) drawTerm(img *image.RGBA) {
+	f := a.f
 	white := image.NewUniform(colText)
 	dim := image.NewUniform(colDim)
 	accent := image.NewUniform(colAccent)
 
-	draw.Draw(img, image.Rect(0, 0, w, barTop), image.NewUniform(colBar), image.Point{}, draw.Src)
+	draw.Draw(img, image.Rect(0, 0, w, f.barTop), image.NewUniform(colBar), image.Point{}, draw.Src)
 	short := a.session
 	if len(short) > 8 {
 		short = short[:8]
@@ -369,24 +541,26 @@ func (a *app) drawTerm(img *image.RGBA) {
 	if a.status != "" {
 		where += " " + a.status
 	}
-	text(img, white, 3, 11, truncate(where, 26))
 	right := fmt.Sprintf("%d/%d %s", a.offset, len(a.lines), time.Now().Format("15:04"))
-	text(img, dim, w-len(right)*7-3, 11, right)
+	rw := font.MeasureString(f.ui, right).Round()
+	f.uiText(img, dim, w-rw-4, f.barTop-3, right)
+	f.uiText(img, white, 3, f.barTop-3, f.fit(where, f.ui, w-rw-12))
 
 	end := len(a.lines) - a.offset
 	if end > len(a.lines) {
 		end = len(a.lines)
 	}
-	start := end - rows
+	start := end - f.rows
 	if start < 0 {
 		start = 0
 	}
 	for i, line := range a.lines[start:end] {
-		text(img, white, 4, textTop+i*lineH, truncate(line, 45))
+		f.monoText(img, white, 4, f.textTop+i*f.pitch, f.fit(line, f.mono, w-8))
 	}
 
-	draw.Draw(img, image.Rect(0, inputY-11, w, inputY+4), image.NewUniform(colInBar), image.Point{}, draw.Src)
-	text(img, accent, 3, inputY, truncate("> "+string(a.buf), 44))
+	inset := inputY - f.lineH
+	draw.Draw(img, image.Rect(0, inset, w, inputY+3), image.NewUniform(colInBar), image.Point{}, draw.Src)
+	f.monoText(img, accent, 3, inputY-3, f.fit("> "+string(a.buf), f.mono, w-8))
 
 	kinds := [5]int{hintUp, hintPageUp, hintEnter, hintPageDown, hintDown}
 	for i, cx := range hintX {
@@ -395,21 +569,22 @@ func (a *app) drawTerm(img *image.RGBA) {
 	}
 }
 
-// drawOverlay is the host/session picker: hosts on the left, their sessions on
-// the right, and an input line when adding a host.
+// drawOverlay is the host/session picker.
 func (a *app) drawOverlay(img *image.RGBA) {
+	f := a.f
 	white := image.NewUniform(colText)
 	dim := image.NewUniform(colDim)
 	accent := image.NewUniform(colAccent)
 
-	draw.Draw(img, image.Rect(0, 0, w, barTop), image.NewUniform(colBar), image.Point{}, draw.Src)
-	text(img, white, 3, 11, "Hosts and sessions")
-	text(img, dim, w-70, 11, "TAB:close")
+	draw.Draw(img, image.Rect(0, 0, w, f.barTop), image.NewUniform(colBar), image.Point{}, draw.Src)
+	f.uiText(img, white, 3, f.barTop-3, "Hosts and sessions")
+	closeW := font.MeasureString(f.ui, "TAB:close").Round()
+	f.uiText(img, dim, w-closeW-4, f.barTop-3, "TAB:close")
 
-	rect(img, 0, barTop, 110, h, color.RGBA{14, 22, 38, 255})
-	text(img, accent, 3, textTop, "this machine")
+	rect(img, 0, f.barTop, 110, h, color.RGBA{14, 22, 38, 255})
+	f.uiText(img, accent, 3, f.textTop, "this machine")
 	for i, host := range a.hosts {
-		y := textTop + (i+1)*lineH
+		y := f.textTop + (i+1)*f.pitch
 		if y > h-24 {
 			break
 		}
@@ -418,36 +593,36 @@ func (a *app) drawOverlay(img *image.RGBA) {
 			label += " (net)"
 		}
 		if a.focus == 0 && i+1 == a.selHost {
-			rect(img, 0, y-11, 110, y+2, colSel)
+			rect(img, 0, y-f.pitch+2, 110, y+3, colSel)
 		}
-		text(img, white, 3, y, truncate(label, 14))
+		f.uiText(img, white, 3, y, f.fit(label, f.ui, 104))
 	}
 
 	if a.focus == 1 && len(a.sels) == 0 && a.status != "" {
-		text(img, dim, 116, textTop, truncate(a.status, 28))
+		f.uiText(img, dim, 116, f.textTop, f.fit(a.status, f.ui, w-120))
 	}
 	for i, s := range a.sels {
-		y := textTop + i*lineH
+		y := f.textTop + i*f.pitch
 		if y > h-24 {
 			break
 		}
 		if a.focus == 1 && i == a.selSes {
-			rect(img, 112, y-11, w, y+2, colSel)
+			rect(img, 112, y-f.pitch+2, w, y+3, colSel)
 		}
 		label := s.Program + " " + s.ID[:min(6, len(s.ID))]
 		if s.Attached > 0 {
 			label += "*"
 		}
-		text(img, white, 116, y, truncate(label, 12))
-		text(img, dim, 116+13*7, y, truncate(s.Dir, 15))
+		x := f.uiText(img, white, 116, y, label)
+		f.uiText(img, dim, x+6, y, f.fit(s.Dir, f.ui, w-x-10))
 	}
 
 	if a.adding {
-		rect(img, 0, h-22, w, h, color.RGBA{20, 30, 48, 255})
-		text(img, accent, 3, h-8, truncate("add: "+string(a.addBuf), 44))
+		rect(img, 0, h-22, w, h, colInBar)
+		f.monoText(img, accent, 3, h-7, f.fit("add: "+string(a.addBuf), f.mono, w-8))
 		return
 	}
-	text(img, dim, 3, h-6, "4/8 mv  6 ok  5 pane  7 sync  0 add")
+	f.uiText(img, dim, 3, h-6, "4/8 mv  6 ok  5 pane  7 sync  0 add")
 }
 
 func (a *app) scroll(delta int) {
@@ -464,20 +639,7 @@ func (a *app) scroll(delta int) {
 	}
 }
 
-func (a *app) page(delta int) { a.scroll(delta * rows) }
-
-func truncate(s string, n int) string {
-	r := []rune(s)
-	if len(r) > n {
-		return string(r[:n-1]) + "~"
-	}
-	return s
-}
-
-func text(img *image.RGBA, c *image.Uniform, x, y int, s string) {
-	d := &font.Drawer{Dst: img, Src: c, Face: basicfont.Face7x13, Dot: fixed.P(x, y)}
-	d.DrawString(s)
-}
+func (a *app) page(delta int) { a.scroll(delta * a.f.rows) }
 
 func rect(img *image.RGBA, x0, y0, x1, y1 int, c color.Color) {
 	draw.Draw(img, image.Rect(x0, y0, x1, y1), image.NewUniform(c), image.Point{}, draw.Src)
@@ -532,6 +694,21 @@ func drawHint(img *image.RGBA, cx, cy, kind int, c *image.Uniform) {
 	}
 }
 
+func bitmapFaces() *faces {
+	f := &faces{mono: basicfont.Face7x13, ui: basicfont.Face7x13}
+	m := f.mono.Metrics()
+	f.lineH = int((m.Ascent + m.Descent + 32) >> 6)
+	f.cellW = 7
+	f.pitch = f.lineH
+	if f.pitch > 13 {
+		f.pitch -= 2 // 12px text on a 15px line wastes a row of the 170px panel
+	}
+	f.barTop = f.lineH
+	f.textTop = f.barTop + f.pitch
+	f.rows = (inputY - 12 - f.textTop) / f.pitch
+	return f
+}
+
 func main() {
 	fbPath := flag.String("fb", "/dev/fb0", "framebuffer device")
 	keyPath := flag.String("key", "", "evdev device; empty finds the tca8418 keyboard")
@@ -539,6 +716,13 @@ func main() {
 	bin := flag.String("gorex", "", "gorex executable; empty uses ~/.local/bin/gorex")
 	session := flag.String("session", "", "session id; empty uses the first one or creates it")
 	secs := flag.Int("secs", 0, "exit after this many seconds (0 = run until ESC)")
+	bench := flag.Int("bench", 0, "render N frames, print the average, then exit")
+	fontSize := flag.Float64("fontsize", 12, "text size in pixels")
+	monoPath := flag.String("mono", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", "terminal font")
+	uiPath := flag.String("ui-font", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "UI font")
+	cjkPath := flag.String("cjk-font", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", "CJK font")
+	useBitmap := flag.Bool("bitmap", false, "use the 7x13 bitmap face instead of the system fonts")
+	startOverlay := flag.Bool("overlay", false, "open the host picker at startup")
 	flag.Parse()
 
 	lock, err := os.OpenFile("/tmp/czgorex.lock", os.O_CREATE|os.O_RDWR, 0o666)
@@ -567,6 +751,17 @@ func main() {
 		}
 	}
 
+	fc := bitmapFaces()
+	if !*useBitmap {
+		if loaded, err := loadFaces(*monoPath, *uiPath, *cjkPath, *fontSize); err != nil {
+			fmt.Println("fonts:", err, "- using the bitmap face")
+		} else {
+			fc = loaded
+			fmt.Printf("font: %s %.0fpx cell=%d line=%d rows=%d\n",
+				filepath.Base(*monoPath), *fontSize, fc.cellW, fc.lineH, fc.rows)
+		}
+	}
+
 	exe := *bin
 	if exe == "" {
 		exe = filepath.Join(os.Getenv("HOME"), ".local", "bin", "gorex")
@@ -574,7 +769,7 @@ func main() {
 	dir := filepath.Join(os.Getenv("HOME"), ".gorex")
 	c := &client{bin: exe, env: append(os.Environ(), "GOREX_DIR="+dir), dir: dir}
 
-	a := &app{status: "connecting"}
+	a := &app{status: "connecting", f: fc}
 	if *session != "" {
 		a.session = *session
 	} else if list, err := c.sessions(""); err == nil && len(list) > 0 {
@@ -618,21 +813,30 @@ func main() {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 
+	if *bench > 0 {
+		start := time.Now()
+		for range *bench {
+			fb.blit(a.draw())
+		}
+		avg := time.Since(start) / time.Duration(*bench)
+		fmt.Printf("bench: %d frames, %v per frame (%.0f fps)\n", *bench, avg, float64(time.Second)/float64(avg))
+		return
+	}
+
 	deadline := time.Now().Add(time.Duration(*secs) * time.Second)
 	tick := time.NewTicker(time.Second)
 	render := func() {
 		img := a.draw()
 		fb.blit(img)
 		if *shot != "" {
-			if f, err := os.Create(*shot); err == nil {
-				png.Encode(f, img)
-				f.Close()
+			if fh, err := os.Create(*shot); err == nil {
+				png.Encode(fh, img)
+				fh.Close()
 			}
 			os.WriteFile(*shot+".fb", fb.buf, 0o644)
 		}
 	}
 
-	// loads the session list of whichever host the overlay has selected.
 	loadSessions := func() {
 		host := ""
 		if a.selHost > 0 && a.selHost-1 < len(a.hosts) {
@@ -663,6 +867,10 @@ func main() {
 	}
 
 	render()
+	if *startOverlay {
+		openOverlay()
+		render()
+	}
 	fmt.Println("UI up")
 
 	for {
