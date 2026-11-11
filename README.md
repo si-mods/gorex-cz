@@ -76,6 +76,30 @@ guide has it (short TAB = TAB, long = voice).
 `-voicetest N` records N seconds, runs the same pipeline and prints the result,
 which is the quickest way to check the microphone without touching the UI.
 
+### Reference service
+
+`tools/asr-server.py` is the network engine used while developing: a ~90 line
+HTTP server in front of sherpa-onnx with the SenseVoice int8 model
+(zh/en/ja/ko/yue). Two shapes, same result:
+
+| Endpoint | Body | Answer |
+|---|---|---|
+| `POST /asr` | raw WAV bytes | `text/plain` with the text |
+| `POST /v1/audio/transcriptions` | `multipart/form-data` with a `file` part (the OpenAI shape) | `{"text": "…"}`, or plain text with `?response_format=text` |
+
+```bash
+python tools/asr-server.py          # ASR_PORT=8710 by default
+
+# device side, no jq needed
+czgorex -stt-cloud 'curl -s -F file=@"$VOICE_WAV" \
+  "http://<pc>:8710/v1/audio/transcriptions?response_format=text"'
+```
+
+The server needs `sherpa-onnx-offline` (Windows/Linux/macOS builds from the
+sherpa-onnx releases) and `sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-*`
+from its `asr-models` release; edit `BIN`, `MODEL` and `TOKENS` at the top.
+It binds `0.0.0.0` with no authentication: LAN only.
+
 ## Hosts and sessions
 
 **TAB** (or the on-screen `TAB:close`) opens the picker:
