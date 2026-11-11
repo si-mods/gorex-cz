@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=GoRex
+Comment=GoRex session client for the CardputerZero panel
+Exec=/home/pi/.local/bin/czgorex
+Icon=share/images/czgorex_256.png
+Terminal=false
+Categories=Utility;
+StartupNotify=false
