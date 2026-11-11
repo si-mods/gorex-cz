@@ -125,11 +125,17 @@ func loadFaces(monoPath, uiPath, cjkPath string, size float64) (*faces, error) {
 	if f.cellW < 6 {
 		f.cellW = 6
 	}
-	f.pitch = f.lineH
-	if f.pitch > 13 {
-		f.pitch -= 2 // 12px text on a 15px line wastes a row of the 170px panel
+	// The terminal grid is tighter than the font's line box: on a 170px
+	// panel the line spacing is what decides how many rows fit.
+	switch {
+	case f.lineH >= 16: // JetBrains Mono at 12px
+		f.pitch = f.lineH - 4
+	case f.lineH >= 14: // DejaVu Sans Mono at 12px
+		f.pitch = f.lineH - 2
+	default:
+		f.pitch = f.lineH
 	}
-	f.barTop = f.lineH
+	f.barTop = 15
 	f.textTop = f.barTop + f.pitch
 	f.rows = (inputY - 12 - f.textTop) / f.pitch
 	if f.rows < 3 {
@@ -558,7 +564,7 @@ func (a *app) drawTerm(img *image.RGBA) {
 		f.monoText(img, white, 4, f.textTop+i*f.pitch, f.fit(line, f.mono, w-8))
 	}
 
-	inset := inputY - f.lineH
+	inset := inputY - f.pitch
 	draw.Draw(img, image.Rect(0, inset, w, inputY+3), image.NewUniform(colInBar), image.Point{}, draw.Src)
 	f.monoText(img, accent, 3, inputY-3, f.fit("> "+string(a.buf), f.mono, w-8))
 
@@ -694,16 +700,32 @@ func drawHint(img *image.RGBA, cx, cy, kind int, c *image.Uniform) {
 	}
 }
 
+// firstExisting returns the first path that exists, or "".
+func firstExisting(paths ...string) string {
+	for _, p := range paths {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
 func bitmapFaces() *faces {
 	f := &faces{mono: basicfont.Face7x13, ui: basicfont.Face7x13}
 	m := f.mono.Metrics()
 	f.lineH = int((m.Ascent + m.Descent + 32) >> 6)
 	f.cellW = 7
-	f.pitch = f.lineH
-	if f.pitch > 13 {
-		f.pitch -= 2 // 12px text on a 15px line wastes a row of the 170px panel
+	// The terminal grid is tighter than the font's line box: on a 170px
+	// panel the line spacing is what decides how many rows fit.
+	switch {
+	case f.lineH >= 16: // JetBrains Mono at 12px
+		f.pitch = f.lineH - 4
+	case f.lineH >= 14: // DejaVu Sans Mono at 12px
+		f.pitch = f.lineH - 2
+	default:
+		f.pitch = f.lineH
 	}
-	f.barTop = f.lineH
+	f.barTop = 15
 	f.textTop = f.barTop + f.pitch
 	f.rows = (inputY - 12 - f.textTop) / f.pitch
 	return f
@@ -718,12 +740,37 @@ func main() {
 	secs := flag.Int("secs", 0, "exit after this many seconds (0 = run until ESC)")
 	bench := flag.Int("bench", 0, "render N frames, print the average, then exit")
 	fontSize := flag.Float64("fontsize", 12, "text size in pixels")
-	monoPath := flag.String("mono", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", "terminal font")
+	monoPath := flag.String("mono", "", "terminal font; empty prefers JetBrains Mono, then DejaVu Sans Mono")
 	uiPath := flag.String("ui-font", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "UI font")
 	cjkPath := flag.String("cjk-font", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", "CJK font")
 	useBitmap := flag.Bool("bitmap", false, "use the 7x13 bitmap face instead of the system fonts")
 	startOverlay := flag.Bool("overlay", false, "open the host picker at startup")
+	fontCheck := flag.Bool("fontcheck", false, "report the fonts and the layout, then exit")
 	flag.Parse()
+
+	if *fontCheck {
+		mono := *monoPath
+		if mono == "" {
+			mono = firstExisting(
+				"/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf",
+				filepath.Join(os.Getenv("HOME"), ".local/share/fonts/JetBrainsMono-Regular.ttf"),
+				"/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+			)
+		}
+		f, err := loadFaces(mono, *uiPath, *cjkPath, *fontSize)
+		if err != nil {
+			fmt.Println("fonts:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("mono=%s ui=%s cjk=%s size=%.0f\n", mono, *uiPath, *cjkPath, *fontSize)
+		fmt.Printf("line=%d pitch=%d cell=%d rows=%d\n", f.lineH, f.pitch, f.cellW, f.rows)
+		if f.cjkFace() != nil {
+			fmt.Println("cjk: loaded")
+		} else {
+			fmt.Println("cjk: unavailable")
+		}
+		return
+	}
 
 	lock, err := os.OpenFile("/tmp/czgorex.lock", os.O_CREATE|os.O_RDWR, 0o666)
 	if err != nil {
@@ -751,14 +798,22 @@ func main() {
 		}
 	}
 
+	mono := *monoPath
+	if mono == "" {
+		mono = firstExisting(
+			"/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf",
+			filepath.Join(os.Getenv("HOME"), ".local/share/fonts/JetBrainsMono-Regular.ttf"),
+			"/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+		)
+	}
 	fc := bitmapFaces()
-	if !*useBitmap {
-		if loaded, err := loadFaces(*monoPath, *uiPath, *cjkPath, *fontSize); err != nil {
+	if !*useBitmap && mono != "" {
+		if loaded, err := loadFaces(mono, *uiPath, *cjkPath, *fontSize); err != nil {
 			fmt.Println("fonts:", err, "- using the bitmap face")
 		} else {
 			fc = loaded
-			fmt.Printf("font: %s %.0fpx cell=%d line=%d rows=%d\n",
-				filepath.Base(*monoPath), *fontSize, fc.cellW, fc.lineH, fc.rows)
+			fmt.Printf("font: %s %.0fpx cell=%d line=%d pitch=%d rows=%d\n",
+				filepath.Base(mono), *fontSize, fc.cellW, fc.lineH, fc.pitch, fc.rows)
 		}
 	}
 

@@ -86,7 +86,7 @@ The UI uses the fonts the CardputerZero image ships, as its app guideline asks
 
 | Use | Face | Path |
 |---|---|---|
-| Terminal, input line | DejaVu Sans Mono 12px | `/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf` |
+| Terminal, input line | JetBrains Mono 12px, else DejaVu Sans Mono | `/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf`, `~/.local/share/fonts/JetBrainsMono-Regular.ttf`, `/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf` |
 | Status bar, picker, lists | DejaVu Sans 12px | `/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf` |
 | CJK (中文 / 日本語 / 한국어) | Noto Sans CJK SC 12px | `/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc` |
 
@@ -96,7 +96,13 @@ rune is drawn — the 19 MB collection costs ~45 MB RSS once it is in use, so a
 few hundred KB until then. On this 320×170 panel 12px gives 7 visible lines of
 session text.
 
-`-bitmap` falls back to the 7×13 bitmap face (smaller, no TrueType, no CJK).
+The terminal face is picked at startup: JetBrains Mono (the guideline's
+terminal font; `sudo apt install fonts-jetbrains-mono` on an image without it),
+then DejaVu Sans Mono, then the bitmap face with `-bitmap`.
+
+Layout follows the face: JetBrains Mono at 12px has a 17px line box, so the
+grid pitch is 13px and 7 rows fit; DejaVu Sans Mono's 15px box gives the same
+7 rows at a 13px pitch.
 
 ## Requirements
 
