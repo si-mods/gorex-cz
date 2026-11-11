@@ -223,6 +223,14 @@ MVP. Known gaps: no colour (ANSI SGR is stripped), no cursor addressing, one
 session only, plain 7×13 bitmap font, and the CLI round trip per poll is
 heavier than a direct socket client would be.
 
+## Testing
+
+The device is used in public places, so **tests never play sound**: the sink
+stays muted (`wpctl set-mute @DEFAULT_AUDIO_SINK@ 1`), and voice input is
+checked with a file instead of the room — `-fakewav sample.wav -stt-cloud …`
+or `-voicetest` over a recording. Recording itself is silent and always
+allowed. See [AGENTS.md](AGENTS.md).
+
 ## License
 
 MIT.
