@@ -343,7 +343,9 @@ func tri(img *image.RGBA, cx, y, width, height, dir int, c color.Color) {
 // drawHint paints one 22x22 glyph centred on (cx, cy).
 func drawHint(img *image.RGBA, cx, cy, kind int, c *image.Uniform) {
 	col := c.C
-	x0, y0 := cx-iconSize/2, cy-iconSize/2
+	// half-open rectangles put a 22px box at x0..x0+21; +1 keeps the
+	// painted centre on the guideline's x instead of half a pixel left of it.
+	x0, y0 := cx-iconSize/2+1, cy-iconSize/2
 	rect(img, x0, y0, x0+iconSize, y0+iconSize, color.RGBA{18, 28, 46, 255})
 	switch kind {
 	case hintUp:
