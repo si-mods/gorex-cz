@@ -1,4 +1,4 @@
-module github.com/si-mods/gorex-cardputer
+module github.com/si-mods/gorex-cz
 
 go 1.26.0
 

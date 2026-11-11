@@ -1,4 +1,4 @@
-# gorex-cardputer
+# gorex-cz
 
 A minimal [GoRex](https://github.com/si-mods/gorex) client for the
 **M5Stack CardputerZero** panel. It has no compositor, no GPU and no cgo: it
