@@ -342,6 +342,14 @@ func readKeys(path string, keys chan<- keyEvent, quit chan<- struct{}) {
 		return
 	}
 	defer unix.Close(fd)
+	// Take the keyboard exclusively: the M5 launcher locks the device when
+	// TAB is held for three seconds, and must not see our push-to-talk hold.
+	const eviocgrab = 0x40044590
+	if err := unix.IoctlSetInt(fd, eviocgrab, 1); err != nil {
+		fmt.Println("keyboard grab:", err)
+	} else {
+		defer unix.IoctlSetInt(fd, eviocgrab, 0)
+	}
 	var buf [24]byte
 	shift := false
 	for {
@@ -351,6 +359,9 @@ func readKeys(path string, keys chan<- keyEvent, quit chan<- struct{}) {
 			continue
 		}
 		ev := *(*inputEvent)(unsafe.Pointer(&buf[0]))
+		if os.Getenv("CZGOREX_DEBUG") != "" {
+			fmt.Printf("raw key code=%d value=%d type=%d\n", ev.Code, ev.Value, ev.Type)
+		}
 		if ev.Type != 1 {
 			continue
 		}
