@@ -46,6 +46,39 @@ non-text states. Type a digit first and keys 4–8 insert digits instead.
 | Backspace | delete a character |
 | ESC | quit and restore the previous framebuffer content |
 
+## Hosts and sessions
+
+**TAB** (or the on-screen `TAB:close`) opens the picker:
+
+```
+Hosts and sessions                    TAB:close
+this machine  | bash 34af3f  /home/pi
+test          | zsh 91c2ab  /srv/app
+4/8 mv  6 ok  5 pane  7 sync  0 add
+```
+
+| Key | Action |
+|---|---|
+| 4 / 8 | move the selection in the focused column |
+| 6 | hosts → load that host's sessions; sessions → attach |
+| 5 | focus the host column and reload its sessions |
+| 7 | reload the selected host's sessions |
+| 0 | add a host: type `name address` and Enter |
+| TAB / ESC | close the picker |
+
+The left column always starts with **this machine** (its local session server),
+followed by every entry of `~/.gorex/hosts.json` as `gorex hosts` shows them.
+The right column lists that host's sessions from `gorex ls --json`
+(program, id, directory, `*` when attached). Choosing a session switches what
+the terminal view attaches to; commands for a remote host run as
+`gorex -S <host> capture|send`, so nothing about the local server changes.
+
+**Adding a host** writes `{id, name, address}` into `~/.gorex/hosts.json`
+(mode 0600). The address is the secret a remote GoRex server prints with
+`gorex remote address`; that server still has to approve this machine's key —
+`gorex remote pair start`, then `gorex remote pending` / `remote approve KEY`
+on its side. Until it does, the host's session list reports unreachable.
+
 ## Requirements
 
 - A CardputerZero (Raspberry Pi CM0, Debian 13 aarch64) with `/dev/fb0` and the

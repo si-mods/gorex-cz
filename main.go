@@ -3,12 +3,17 @@ package main
 // czgorex: a GoRex client for the CardputerZero panel.
 //
 // It draws straight into /dev/fb0 (no compositor, no GPU), reads the matrix
-// keyboard from evdev, and talks to the local GoRex session server through the
-// gorex CLI. The bottom bar follows CardputerZero's key guideline: five 22x22
-// hints centred on x = 49, 105, 161, 217, 273 at y = 153, one per key 4..8,
-// each with a short tick pointing at its key.
+// keyboard from evdev, and talks to GoRex through the gorex CLI — the local
+// session server by default, or a saved remote host picked from the overlay.
+//
+// The bottom bar follows CardputerZero's key guideline: five 22x22 hints
+// centred on x = 49, 105, 161, 217, 273 at y = 153, one per key 4..8, each
+// with a short tick pointing at its key.
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"image"
@@ -21,6 +26,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -35,18 +41,26 @@ const (
 	w = 320
 	h = 170
 
-	barTop    = 14  // status bar height
-	lineH     = 13  // text line height
-	textTop   = 26  // first terminal baseline
-	rows      = 8   // terminal rows between the bars
-	inputY    = 133 // input baseline
-	iconY     = 153 // key hint centre, per the CardputerZero guideline
-	iconSize  = 22  // hint size, per the guideline
-	keyBarTop = iconY - iconSize/2
+	barTop   = 14
+	lineH    = 13
+	textTop  = 26
+	rows     = 8
+	inputY   = 133
+	iconY    = 153
+	iconSize = 22
 )
 
 // Hint centres from the official guideline: keys 4, 5, 6, 7, 8.
 var hintX = [5]int{49, 105, 161, 217, 273}
+
+var (
+	colBar    = color.RGBA{26, 40, 66, 255}
+	colInBar  = color.RGBA{20, 30, 48, 255}
+	colText   = color.RGBA{232, 238, 250, 255}
+	colDim    = color.RGBA{140, 160, 190, 255}
+	colAccent = color.RGBA{120, 220, 255, 255}
+	colSel    = color.RGBA{36, 62, 96, 255}
+)
 
 type framebuffer struct {
 	f      *os.File
@@ -166,8 +180,7 @@ func readKeys(path string, keys chan<- keyEvent, quit chan<- struct{}) {
 			continue
 		case keyEsc:
 			if ev.Value == 1 {
-				close(quit)
-				return
+				keys <- keyEvent{Code: keyEsc}
 			}
 			continue
 		}
@@ -179,10 +192,11 @@ func readKeys(path string, keys chan<- keyEvent, quit chan<- struct{}) {
 	}
 }
 
-// client wraps the gorex CLI against the local session server.
+// client wraps the gorex CLI, either against the local server or -S host.
 type client struct {
 	bin string
 	env []string
+	dir string
 }
 
 func (c *client) run(args ...string) (string, error) {
@@ -192,27 +206,93 @@ func (c *client) run(args ...string) (string, error) {
 	return string(out), err
 }
 
-func (c *client) session() (string, error) {
-	if out, err := c.run("ls"); err == nil {
-		for _, line := range strings.Split(out, "\n")[1:] {
-			if f := strings.Fields(line); len(f) > 0 {
-				return f[0], nil
-			}
-		}
-	}
-	out, err := c.run("new", "--dir", os.Getenv("HOME"))
+type hostEntry struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Network bool   `json:"network,omitempty"`
+}
+
+type sessionEntry struct {
+	ID       string `json:"id"`
+	Program  string `json:"program"`
+	Dir      string `json:"dir"`
+	Title    string `json:"title"`
+	Idle     bool   `json:"idle"`
+	Attached int    `json:"attached"`
+}
+
+func (c *client) hosts() ([]hostEntry, error) {
+	out, err := c.run("hosts", "--json")
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return strings.TrimSpace(strings.Split(strings.TrimSpace(out), "\n")[0]), nil
+	var hosts []hostEntry
+	if err := json.Unmarshal([]byte(out), &hosts); err != nil {
+		return nil, err
+	}
+	return hosts, nil
 }
 
-func (c *client) capture(id string) (string, error) {
-	return c.run("capture", "-s", id, "--history", "65536")
+// addHost records a host in hosts.json. The address is the tailcat address a
+// remote server prints with `gorex remote address`; the other side must
+// approve this machine's key (its `gorex remote pending` / `approve KEY`).
+func (c *client) addHost(name, address string) error {
+	type savedHost struct {
+		ID      string `json:"id"`
+		Name    string `json:"name"`
+		Address string `json:"address"`
+		Network bool   `json:"network,omitempty"`
+	}
+	type hostsFile struct {
+		Hosts []savedHost `json:"hosts"`
+	}
+	path := filepath.Join(c.dir, "hosts.json")
+	f := hostsFile{}
+	if b, err := os.ReadFile(path); err == nil {
+		if err := json.Unmarshal(b, &f); err != nil {
+			return fmt.Errorf("hosts.json is not valid: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	var idb [4]byte
+	if _, err := rand.Read(idb[:]); err != nil {
+		return err
+	}
+	f.Hosts = append(f.Hosts, savedHost{ID: hex.EncodeToString(idb[:]), Name: name, Address: address})
+	b, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(b, '\n'), 0o600)
 }
 
-func (c *client) send(id, text string) error {
-	_, err := c.run("send", "-s", id, "--enter", text)
+// sessionArgs puts -S before the command when a remote host is selected.
+func sessionArgs(host string, args ...string) []string {
+	if host == "" {
+		return args
+	}
+	return append([]string{"-S", host}, args...)
+}
+
+func (c *client) sessions(host string) ([]sessionEntry, error) {
+	out, err := c.run(sessionArgs(host, "ls", "--json")...)
+	if err != nil {
+		return nil, err
+	}
+	var list []sessionEntry
+	if err := json.Unmarshal([]byte(out), &list); err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
+func (c *client) capture(host, id string) (string, error) {
+	return c.run(sessionArgs(host, "capture", "-s", id, "--history", "65536")...)
+}
+
+func (c *client) send(host, id, text string) error {
+	_, err := c.run(sessionArgs(host, "send", "-s", id, "--enter", text)...)
 	return err
 }
 
@@ -229,23 +309,25 @@ func screenLines(raw string) []string {
 }
 
 type app struct {
-	buf    []rune
-	lines  []string
-	offset int // lines scrolled back from the tail
-	status string
-
+	mu      sync.Mutex
+	host    string // "" = this machine's server
 	session string
-	bg      *image.RGBA
-}
+	buf     []rune
+	lines   []string
+	offset  int
+	status  string
 
-var (
-	colBG     = color.RGBA{10, 16, 30, 255}
-	colBar    = color.RGBA{26, 40, 66, 255}
-	colInBar  = color.RGBA{20, 30, 48, 255}
-	colText   = color.RGBA{232, 238, 250, 255}
-	colDim    = color.RGBA{140, 160, 190, 255}
-	colAccent = color.RGBA{120, 220, 255, 255}
-)
+	overlay bool
+	hosts   []hostEntry
+	sels    []sessionEntry
+	selHost int
+	selSes  int
+	focus   int // 0 hosts, 1 sessions
+	adding  bool
+	addBuf  []rune
+
+	bg *image.RGBA
+}
 
 func (a *app) draw() *image.RGBA {
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
@@ -262,26 +344,35 @@ func (a *app) draw() *image.RGBA {
 		}
 	}
 	copy(img.Pix, a.bg.Pix)
+	if a.overlay {
+		a.drawOverlay(img)
+		return img
+	}
+	a.drawTerm(img)
+	return img
+}
 
+func (a *app) drawTerm(img *image.RGBA) {
 	white := image.NewUniform(colText)
 	dim := image.NewUniform(colDim)
 	accent := image.NewUniform(colAccent)
 
-	// status bar
 	draw.Draw(img, image.Rect(0, 0, w, barTop), image.NewUniform(colBar), image.Point{}, draw.Src)
 	short := a.session
 	if len(short) > 8 {
 		short = short[:8]
 	}
-	left := "GoRex " + short
-	if a.status != "" {
-		left += " " + a.status
+	where := "GoRex " + short
+	if a.host != "" {
+		where = a.host + " " + short
 	}
-	text(img, white, 3, 11, truncate(left, 28))
+	if a.status != "" {
+		where += " " + a.status
+	}
+	text(img, white, 3, 11, truncate(where, 26))
 	right := fmt.Sprintf("%d/%d %s", a.offset, len(a.lines), time.Now().Format("15:04"))
 	text(img, dim, w-len(right)*7-3, 11, right)
 
-	// terminal window
 	end := len(a.lines) - a.offset
 	if end > len(a.lines) {
 		end = len(a.lines)
@@ -294,41 +385,104 @@ func (a *app) draw() *image.RGBA {
 		text(img, white, 4, textTop+i*lineH, truncate(line, 45))
 	}
 
-	// input line
 	draw.Draw(img, image.Rect(0, inputY-11, w, inputY+4), image.NewUniform(colInBar), image.Point{}, draw.Src)
 	text(img, accent, 3, inputY, truncate("> "+string(a.buf), 44))
 
-	// key hints: five 22x22 icons over keys 4..8, each with a tick below
-	a.drawHints(img, accent)
-	return img
-}
-
-// drawHints follows the CardputerZero guideline: icons 22x22 centred at
-// y = 153 on x = 49, 105, 161, 217, 273, with a short vertical tick from the
-// bottom of each icon down to the screen edge.
-func (a *app) drawHints(img *image.RGBA, accent *image.Uniform) {
 	kinds := [5]int{hintUp, hintPageUp, hintEnter, hintPageDown, hintDown}
 	for i, cx := range hintX {
 		drawHint(img, cx, iconY, kinds[i], accent)
-		// tick pointing at the key below
 		rect(img, cx-1, iconY+iconSize/2+1, cx+2, h-1, accent.C)
 	}
 }
 
-const (
-	hintUp = iota
-	hintDown
-	hintPageUp
-	hintPageDown
-	hintEnter
-)
+// drawOverlay is the host/session picker: hosts on the left, their sessions on
+// the right, and an input line when adding a host.
+func (a *app) drawOverlay(img *image.RGBA) {
+	white := image.NewUniform(colText)
+	dim := image.NewUniform(colDim)
+	accent := image.NewUniform(colAccent)
+
+	draw.Draw(img, image.Rect(0, 0, w, barTop), image.NewUniform(colBar), image.Point{}, draw.Src)
+	text(img, white, 3, 11, "Hosts and sessions")
+	text(img, dim, w-70, 11, "TAB:close")
+
+	rect(img, 0, barTop, 110, h, color.RGBA{14, 22, 38, 255})
+	text(img, accent, 3, textTop, "this machine")
+	for i, host := range a.hosts {
+		y := textTop + (i+1)*lineH
+		if y > h-24 {
+			break
+		}
+		label := host.Name
+		if host.Network {
+			label += " (net)"
+		}
+		if a.focus == 0 && i+1 == a.selHost {
+			rect(img, 0, y-11, 110, y+2, colSel)
+		}
+		text(img, white, 3, y, truncate(label, 14))
+	}
+
+	if a.focus == 1 && len(a.sels) == 0 && a.status != "" {
+		text(img, dim, 116, textTop, truncate(a.status, 28))
+	}
+	for i, s := range a.sels {
+		y := textTop + i*lineH
+		if y > h-24 {
+			break
+		}
+		if a.focus == 1 && i == a.selSes {
+			rect(img, 112, y-11, w, y+2, colSel)
+		}
+		label := s.Program + " " + s.ID[:min(6, len(s.ID))]
+		if s.Attached > 0 {
+			label += "*"
+		}
+		text(img, white, 116, y, truncate(label, 12))
+		text(img, dim, 116+13*7, y, truncate(s.Dir, 15))
+	}
+
+	if a.adding {
+		rect(img, 0, h-22, w, h, color.RGBA{20, 30, 48, 255})
+		text(img, accent, 3, h-8, truncate("add: "+string(a.addBuf), 44))
+		return
+	}
+	text(img, dim, 3, h-6, "4/8 mv  6 ok  5 pane  7 sync  0 add")
+}
+
+func (a *app) scroll(delta int) {
+	a.offset += delta
+	max := len(a.lines) - 1
+	if max < 0 {
+		max = 0
+	}
+	if a.offset > max {
+		a.offset = max
+	}
+	if a.offset < 0 {
+		a.offset = 0
+	}
+}
+
+func (a *app) page(delta int) { a.scroll(delta * rows) }
+
+func truncate(s string, n int) string {
+	r := []rune(s)
+	if len(r) > n {
+		return string(r[:n-1]) + "~"
+	}
+	return s
+}
+
+func text(img *image.RGBA, c *image.Uniform, x, y int, s string) {
+	d := &font.Drawer{Dst: img, Src: c, Face: basicfont.Face7x13, Dot: fixed.P(x, y)}
+	d.DrawString(s)
+}
 
 func rect(img *image.RGBA, x0, y0, x1, y1 int, c color.Color) {
 	draw.Draw(img, image.Rect(x0, y0, x1, y1), image.NewUniform(c), image.Point{}, draw.Src)
 }
 
-// tri draws a filled isosceles triangle: apex at (cx, y) for dir < 0 or the
-// flat edge there for dir > 0, of the given width and height.
 func tri(img *image.RGBA, cx, y, width, height, dir int, c color.Color) {
 	for i := range height {
 		half := (width / 2) * (i + 1) / height
@@ -340,7 +494,14 @@ func tri(img *image.RGBA, cx, y, width, height, dir int, c color.Color) {
 	}
 }
 
-// drawHint paints one 22x22 glyph centred on (cx, cy).
+const (
+	hintUp = iota
+	hintDown
+	hintPageUp
+	hintPageDown
+	hintEnter
+)
+
 func drawHint(img *image.RGBA, cx, cy, kind int, c *image.Uniform) {
 	col := c.C
 	// half-open rectangles put a 22px box at x0..x0+21; +1 keeps the
@@ -365,23 +526,10 @@ func drawHint(img *image.RGBA, cx, cy, kind int, c *image.Uniform) {
 	case hintEnter:
 		rect(img, cx-7, cy+2, cx+7, cy+4, col)
 		rect(img, cx+5, cy-6, cx+7, cy+4, col)
-		for i := range 4 { // arrowhead pointing left
+		for i := range 4 {
 			rect(img, cx-9+i, cy+3-i, cx-8+i, cy+4+i, col)
 		}
 	}
-}
-
-func truncate(s string, n int) string {
-	r := []rune(s)
-	if len(r) > n {
-		return string(r[:n-1]) + "~"
-	}
-	return s
-}
-
-func text(img *image.RGBA, c *image.Uniform, x, y int, s string) {
-	d := &font.Drawer{Dst: img, Src: c, Face: basicfont.Face7x13, Dot: fixed.P(x, y)}
-	d.DrawString(s)
 }
 
 func main() {
@@ -423,20 +571,20 @@ func main() {
 	if exe == "" {
 		exe = filepath.Join(os.Getenv("HOME"), ".local", "bin", "gorex")
 	}
-	c := &client{
-		bin: exe,
-		env: append(os.Environ(), "GOREX_DIR="+filepath.Join(os.Getenv("HOME"), ".gorex")),
-	}
-	id := *session
-	if id == "" {
-		if id, err = c.session(); err != nil {
-			fmt.Println("session:", err)
-			os.Exit(1)
-		}
-	}
-	fmt.Println("session:", id)
+	dir := filepath.Join(os.Getenv("HOME"), ".gorex")
+	c := &client{bin: exe, env: append(os.Environ(), "GOREX_DIR="+dir), dir: dir}
 
-	a := &app{session: id, status: "connecting"}
+	a := &app{status: "connecting"}
+	if *session != "" {
+		a.session = *session
+	} else if list, err := c.sessions(""); err == nil && len(list) > 0 {
+		a.session = list[0].ID
+	} else if out, err := c.run("new", "--dir", os.Getenv("HOME")); err == nil {
+		a.session = strings.TrimSpace(strings.Split(strings.TrimSpace(out), "\n")[0])
+	} else {
+		a.status = "no session"
+	}
+	fmt.Println("session:", a.session)
 
 	keys := make(chan keyEvent, 64)
 	quit := make(chan struct{})
@@ -450,7 +598,14 @@ func main() {
 				return
 			default:
 			}
-			out, err := c.capture(id)
+			a.mu.Lock()
+			host, id := a.host, a.session
+			a.mu.Unlock()
+			if id == "" {
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+			out, err := c.capture(host, id)
 			if err != nil {
 				screens <- nil
 			} else {
@@ -477,20 +632,35 @@ func main() {
 		}
 	}
 
-	scroll := func(delta int) {
-		a.offset += delta
-		max := len(a.lines) - 1
-		if max < 0 {
-			max = 0
+	// loads the session list of whichever host the overlay has selected.
+	loadSessions := func() {
+		host := ""
+		if a.selHost > 0 && a.selHost-1 < len(a.hosts) {
+			host = a.hosts[a.selHost-1].Name
 		}
-		if a.offset > max {
-			a.offset = max
+		list, err := c.sessions(host)
+		if err != nil {
+			a.sels = nil
+			a.status = "host unreachable"
+			return
 		}
-		if a.offset < 0 {
-			a.offset = 0
-		}
+		a.sels = list
+		a.selSes = 0
+		a.status = ""
 	}
-	page := func(delta int) { scroll(delta * rows) }
+	openOverlay := func() {
+		hosts, err := c.hosts()
+		if err != nil {
+			hosts = nil
+		}
+		a.hosts = hosts
+		a.overlay = true
+		a.adding = false
+		a.addBuf = nil
+		a.focus = 0
+		a.selHost = 0
+		loadSessions()
+	}
 
 	render()
 	fmt.Println("UI up")
@@ -498,18 +668,111 @@ func main() {
 	for {
 		select {
 		case k := <-keys:
-			// Keys 4..8 drive the bottom bar while the input line is empty;
-			// with text in it they type digits. F/Z/X/C act as arrows when
-			// not typing, as the guideline recommends.
+			if k.Code == keyEsc {
+				if a.adding {
+					a.adding = false
+					a.addBuf = nil
+					render()
+					continue
+				}
+				if a.overlay {
+					a.overlay = false
+					render()
+					continue
+				}
+				fmt.Println("ESC")
+				return
+			}
+			if a.adding {
+				switch k.Code {
+				case keyEnter:
+					fields := strings.Fields(string(a.addBuf))
+					a.adding = false
+					a.addBuf = nil
+					if len(fields) >= 2 {
+						name := fields[0]
+						addr := fields[len(fields)-1]
+						if err := c.addHost(name, addr); err != nil {
+							a.status = "add failed"
+						} else {
+							a.status = "host added"
+							hosts, _ := c.hosts()
+							a.hosts = hosts
+						}
+					}
+				case keyBackspace:
+					if len(a.addBuf) > 0 {
+						a.addBuf = a.addBuf[:len(a.addBuf)-1]
+					}
+				default:
+					if k.Rune != 0 && len(a.addBuf) < 120 {
+						a.addBuf = append(a.addBuf, k.Rune)
+					}
+				}
+				render()
+				continue
+			}
+			if a.overlay {
+				switch {
+				case k.Code == keyTab:
+					a.overlay = false
+				case k.Code == keyEnter:
+					if a.focus == 0 {
+						loadSessions()
+						a.focus = 1
+					} else if a.selSes < len(a.sels) {
+						a.mu.Lock()
+						a.host = ""
+						if a.selHost > 0 {
+							a.host = a.hosts[a.selHost-1].Name
+						}
+						a.session = a.sels[a.selSes].ID
+						a.lines, a.offset, a.status = nil, 0, ""
+						a.mu.Unlock()
+						a.overlay = false
+					}
+				case k.Code == 5: // KEY_4 up
+					if a.focus == 0 {
+						if a.selHost > 0 {
+							a.selHost--
+						}
+					} else if a.selSes > 0 {
+						a.selSes--
+					}
+				case k.Code == 9: // KEY_8 down
+					if a.focus == 0 {
+						if a.selHost < len(a.hosts) {
+							a.selHost++
+						}
+					} else if a.selSes < len(a.sels)-1 {
+						a.selSes++
+					}
+				case k.Code == 6: // KEY_5
+					a.focus = 0
+					loadSessions()
+				case k.Code == 8: // KEY_7 refresh
+					loadSessions()
+				case k.Code == 11: // KEY_0 add host
+					a.adding = true
+					a.addBuf = nil
+				}
+				render()
+				continue
+			}
+
 			empty := len(a.buf) == 0
 			switch {
+			case k.Code == keyTab:
+				openOverlay()
 			case k.Code == keyEnter:
 				line := strings.TrimSpace(string(a.buf))
 				a.buf = nil
 				if line != "" {
 					a.status = "sent"
-					g, s := c, id
-					go func() { _ = g.send(s, line) }()
+					a.mu.Lock()
+					host, id := a.host, a.session
+					a.mu.Unlock()
+					go func() { _ = c.send(host, id, line) }()
 				}
 			case k.Code == keyBackspace:
 				if len(a.buf) > 0 {
@@ -518,33 +781,35 @@ func main() {
 			case empty && k.Code >= 5 && k.Code <= 9: // KEY_4..KEY_8
 				switch k.Code {
 				case 5:
-					scroll(1)
+					a.scroll(1)
 				case 6:
-					page(1)
+					a.page(1)
 				case 7:
 					line := strings.TrimSpace(string(a.buf))
 					a.buf = nil
 					if line != "" {
 						a.status = "sent"
-						g, s := c, id
-						go func() { _ = g.send(s, line) }()
+						a.mu.Lock()
+						host, id := a.host, a.session
+						a.mu.Unlock()
+						go func() { _ = c.send(host, id, line) }()
 					}
 				case 8:
-					page(-1)
+					a.page(-1)
 				case 9:
-					scroll(-1)
+					a.scroll(-1)
 				}
 			case empty && (k.Code == 33 || k.Code == 45 || k.Code == 44 || k.Code == 46):
 				// F up, X down, Z page up, C page down
 				switch k.Code {
 				case 33:
-					scroll(1)
+					a.scroll(1)
 				case 45:
-					scroll(-1)
+					a.scroll(-1)
 				case 44:
-					page(1)
+					a.page(1)
 				case 46:
-					page(-1)
+					a.page(-1)
 				}
 			case k.Rune != 0:
 				if len(a.buf) < 44 {
@@ -558,9 +823,9 @@ func main() {
 				render()
 				continue
 			}
-			a.status = ""
 			a.lines = lines
-			scroll(0) // clamp the offset to the new length
+			a.status = ""
+			a.scroll(0)
 			render()
 		case <-tick.C:
 			if *secs > 0 && time.Now().After(deadline) {
