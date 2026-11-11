@@ -76,6 +76,29 @@ guide has it (short TAB = TAB, long = voice).
 `-voicetest N` records N seconds, runs the same pipeline and prints the result,
 which is the quickest way to check the microphone without touching the UI.
 
+### Streaming
+
+With `-stt-stream ws://host:8711/stream`, a TAB hold streams the microphone
+instead of recording a file: 16 kHz mono PCM16 frames go up the WebSocket while
+partial transcripts come back and are shown in the status bar, and the final
+transcript lands in the input line when the key is released.
+
+| Direction | Frame | Meaning |
+|---|---|---|
+| client → server | binary | raw PCM16LE, 16 kHz, mono, any chunk size |
+| client → server | text | `{"type": "end"}` finishes the utterance |
+| server → client | text | `{"partial": "...", "t": 1.2}` |
+| server → client | text | `{"final": "...", "stream": "...", "elapsed": 4.1}` |
+| server → client | text | `{"error": "..."}` |
+
+`tools/asr-stream.py` is the reference server: partials come from a streaming
+zipformer (incremental, ~10 ms per 100 ms of audio), the final is re-decoded
+with SenseVoice for accuracy. Measured on the LAN: partial lag ≈ 0.0–0.2 s
+behind the audio, final ~1–2 s after the key is released.
+
+`-fakewav` works here too: the file is paced out at real time, so the whole
+streaming path can be tested in silence.
+
 ### Reference service
 
 `tools/asr-server.py` is the network engine used while developing: a ~90 line
@@ -226,6 +249,7 @@ of them may run: `Conflicts=` hands the panel over in both directions. A
 | `-voice-dir` | `~/.local/share/czgorex` | where recordings are kept |
 | `-mic` | `plughw:1,0` | ALSA capture device (ES8389) |
 | `-voicetest` | 0 | record N seconds, transcribe, print, exit |
+| `-stt-stream` | — | WebSocket streaming endpoint (`ws://host:8711/stream`) |
 
 Exiting (ESC, SIGTERM) writes the framebuffer content captured at startup back
 to the panel, so the launcher's screen is restored rather than left half drawn.

@@ -16,6 +16,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -582,10 +583,13 @@ type app struct {
 	rec       *recorder
 	holdTimer *time.Timer
 
-	sttLocal string
-	sttCloud string
-	sttPick  int // 0 local, 1 cloud
-	sttNames [2]string
+	sttLocal  string
+	sttCloud  string
+	sttStream string
+	sttPick   int // 0 local, 1 cloud
+	stream    *streamer
+	partial   string
+	sttNames  [2]string
 
 	f  *faces
 	bg *image.RGBA
@@ -629,7 +633,9 @@ func (a *app) drawTerm(img *image.RGBA) {
 	if a.host != "" {
 		where = a.host + " " + short
 	}
-	if a.status != "" {
+	if a.partial != "" && a.stream != nil {
+		where += " " + a.partial
+	} else if a.status != "" {
 		where += " " + a.status
 	}
 	right := fmt.Sprintf("%d/%d %s", a.offset, len(a.lines), time.Now().Format("15:04"))
@@ -724,6 +730,24 @@ func (a *app) drawOverlay(img *image.RGBA) {
 		return
 	}
 	f.uiText(img, dim, 3, h-6, "4/8 mv  6 ok  5 pane  7 sync  0 add")
+}
+
+// partialCh is the live transcript channel, or nil when not streaming, so the
+// select can wait on it harmlessly.
+func (a *app) partialCh() chan string {
+	if a.stream == nil {
+		return nil
+	}
+	return a.stream.partials
+}
+
+// short cuts a string to n runes with an ellipsis, for the status bar.
+func short(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 func (a *app) scroll(delta int) {
@@ -849,6 +873,7 @@ func main() {
 	voiceDir := flag.String("voice-dir", "", "where recordings go (default ~/.local/share/czgorex)")
 	voiceTest := flag.Float64("voicetest", 0, "record N seconds, transcribe, print and exit")
 	mic := flag.String("mic", "plughw:1,0", "ALSA capture device (ES8389)")
+	sttStream := flag.String("stt-stream", "", "streaming speech-to-text endpoint, e.g. ws://192.168.8.203:8711/stream")
 	fakeWav := flag.String("fakewav", "", "use this wav instead of the microphone (testing)")
 	flag.Parse()
 
@@ -982,7 +1007,7 @@ func main() {
 	dir := filepath.Join(os.Getenv("HOME"), ".gorex")
 	c := &client{bin: exe, env: append(os.Environ(), "GOREX_DIR="+dir), dir: dir}
 
-	a := &app{status: "connecting", f: fc, sttLocal: *sttLocal, sttCloud: *sttCloud}
+	a := &app{status: "connecting", f: fc, sttLocal: *sttLocal, sttCloud: *sttCloud, sttStream: *sttStream}
 	a.sttNames = [2]string{"local", "cloud"}
 	if strings.EqualFold(*sttDefault, "cloud") && a.sttCloud != "" {
 		a.sttPick = 1
@@ -1301,6 +1326,17 @@ func main() {
 			render()
 		case dir := <-voiceStart:
 			if a.rec == nil {
+				if a.sttStream != "" {
+					st, err := startStream(context.Background(), a.sttStream, *mic, *fakeWav)
+					if err != nil {
+						a.status = "stream: " + err.Error()
+					} else {
+						a.stream = st
+						a.status = "REC"
+					}
+					render()
+					continue
+				}
 				r, err := startCapture(dir)
 				if err != nil {
 					a.status = "mic: " + err.Error()
@@ -1310,7 +1346,29 @@ func main() {
 				}
 				render()
 			}
+		case txt := <-a.partialCh():
+			a.partial = txt
+			if a.rec != nil {
+				a.status = fmt.Sprintf("REC %.1fs", time.Since(a.rec.started).Seconds())
+			} else if a.stream != nil {
+				a.status = "REC " + short(txt, 22)
+			}
+			render()
 		case <-voiceStop:
+			if a.stream != nil {
+				st := a.stream
+				a.stream = nil
+				a.status = "listening…"
+				render()
+				go func() {
+					txt, err := st.stop(6 * time.Second)
+					if err != nil {
+						txt = ""
+					}
+					voiceDone <- txt
+				}()
+				continue
+			}
 			if a.rec == nil {
 				a.status = ""
 				toggleOverlay()
